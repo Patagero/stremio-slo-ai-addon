@@ -1,0 +1,5 @@
+const test=require('node:test'); const assert=require('node:assert/strict'); const {buildPrompt,srtEntries,validateSrt,manifest}=require('../server');
+const sample='1\n00:00:01,000 --> 00:00:03,000\nI was ready.\n\n2\n00:00:04,000 --> 00:00:06,000\nAre you ready?';
+test('prompt includes metadata and Slovenian gender protocol',()=>{const p=buildPrompt({title:'Demo',plot:'A drama',characters:'Sarah: female\nJohn: male',source:sample}); assert.match(p,/Sarah: female/); assert.match(p,/bila sem/); assert.match(p,/si videla\/videl/); assert.match(p,/Never infer gender from voice alone/);});
+test('SRT validator rejects changed timestamps and cue counts',()=>{assert.equal(validateSrt(sample,'1\n00:00:01,000 --> 00:00:03,000\nBila sem pripravljena.\n\n2\n00:00:04,000 --> 00:00:06,000\nSi pripravljen?'),true); assert.equal(validateSrt(sample,'1\n00:00:00,000 --> 00:00:03,000\nBila sem.'),false);});
+test('manifest advertises Slovenian subtitle resource',()=>{const m=manifest(); assert.deepEqual(m.resources,['subtitles']); assert.deepEqual(m.types,['movie','series']); assert.equal(m.id,'com.stremio.slo.ai.translator');});

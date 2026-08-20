@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: stremio-slo-ai-addon
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 7002
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENSUBTITLES_API_KEY
+        sync: false
+      - key: OPENSUBTITLES_USER_AGENT
+        value: SloAIAddon v0.1.0
