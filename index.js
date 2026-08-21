@@ -44,6 +44,19 @@ function buildErrorSrt(message) {
   const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180);
   return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`;
 }
+function createSubtitleFileWaiter({ cache: cacheStore, jobs: jobsStore, pollMs = 1000, timeoutMs = 120000 } = {}) {
+  return async function waitForSubtitleFile(jobKey) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const entry = cacheStore.get(jobKey);
+      if (entry?.srt && entry.expiresAt > Date.now()) return entry.srt;
+      const job = jobsStore.get(jobKey);
+      if (job?.status === 'failed') throw new Error(job.error || 'Translation failed');
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    throw new Error('Translation timed out');
+  };
+}
 function manifest() { return addonManifest; }
 function createApp() {
   const app = express();
@@ -54,7 +67,19 @@ function createApp() {
   app.get('/manifest', (_req, res) => res.json(manifest()));
   app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, processingJobs: jobs.size, completedJobs: completed.size, anthropicConfigured: Boolean(anthropic), anthropicModel: resolvedAnthropicModel || 'auto-detect', tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables.</p>'));
-  app.get('/subtitle-file/:token.srt', (req, res) => { const srt = subtitleFiles.get(req.params.token); if (!srt) return res.sendStatus(404); return res.type('application/x-subrip; charset=utf-8').send(srt); });
+  app.get('/subtitle-file/:token.srt', async (req, res) => {
+    const file = subtitleFiles.get(req.params.token);
+    if (!file) return res.sendStatus(404);
+    if (file.status === 'ready') return res.type('application/x-subrip; charset=utf-8').send(file.srt);
+    try {
+      const srt = await createSubtitleFileWaiter({ cache, jobs, pollMs: 500, timeoutMs: 120000 })(file.jobKey);
+      file.status = 'ready'; file.srt = srt;
+      return res.type('application/x-subrip; charset=utf-8').send(srt);
+    } catch (error) {
+      console.error(`[translation-file] ${error.message}`);
+      return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message));
+    }
+  });
   app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
     console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
     const type = req.params[0];
@@ -63,9 +88,9 @@ function createApp() {
     const sourceLanguage = String(req.query.sourceLanguage || 'en').toLowerCase();
     const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL || 'auto'}`;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
-    const publish = (srt, label = 'Slovenian AI') => {
+    const publish = (srt, label = 'Slovenian AI', status = 'ready') => {
       const token = crypto.randomUUID();
-      subtitleFiles.set(token, srt);
+      subtitleFiles.set(token, { status, jobKey: key, srt });
       setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
       return { id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
     };
@@ -80,10 +105,10 @@ function createApp() {
         .catch(error => { jobs.get(key).error = error.message; jobs.get(key).status = 'failed'; console.error(`[translation] ${error.message}`); })
         .finally(() => { const job = jobs.get(key); if (job?.status === 'processing') job.status = 'completed'; });
     }
-    return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)')] });
+    return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)', 'waiting')] });
   });
   app.get('/jobs/:jobKey', (req, res) => { const key = decodeURIComponent(req.params.jobKey); return res.json(jobs.get(key) || completed.get(key) || { status: 'unknown' }); });
   return app;
 }
 if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
-module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt };
+module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter };
