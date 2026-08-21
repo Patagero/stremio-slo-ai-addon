@@ -6,7 +6,8 @@ const { default: SrtParser } = require('srt-parser-2');
 const srtParser = new SrtParser();
 
 const PORT = Number(process.env.PORT || 7002);
-const CHUNK_SIZE = 45;
+const CHUNK_SIZE = 30;
+const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.TRANSLATION_CONCURRENCY || 2)));
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const configuredAnthropicModel = String(process.env.ANTHROPIC_MODEL || '').trim();
 const RETIRED_ANTHROPIC_MODELS = new Set(['claude-3-5-sonnet-20240620', 'claude-3-5-sonnet-latest', 'claude-sonnet-4-20250514']);
@@ -36,7 +37,21 @@ async function fetchOpenSubtitle(imdbId, language) { if (!process.env.OPENSUBTIT
 function selectAnthropicModel(models = []) { const ids = models.map(model => String(model.id || model.name || '')).filter(Boolean); const preferred = [/claude-sonnet-4/i, /claude-3-7-sonnet/i, /claude-3-5-sonnet/i, /claude-sonnet/i, /claude-3-haiku/i]; for (const pattern of preferred) { const match = ids.find(id => pattern.test(id)); if (match) return match; } return ids[0] || null; }
 async function resolveAnthropicModel() { if (resolvedAnthropicModel) return resolvedAnthropicModel; if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const result = await anthropic.models.list({ limit: 100 }); resolvedAnthropicModel = selectAnthropicModel(result.data || []); if (!resolvedAnthropicModel) throw new Error('Anthropic account exposes no usable models'); console.log(`[anthropic] selected model ${resolvedAnthropicModel}`); return resolvedAnthropicModel; }
 async function translateChunk(chunk, context, previous = '') { if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const message = await anthropic.messages.create({ model: await resolveAnthropicModel(), max_tokens: 8192, temperature: 0.1, system: systemPrompt(`${context}\nPrevious translated context:\n${previous || 'None'}`), messages: [{ role: 'user', content: `Translate this SRT chunk. Preserve every number and timestamp exactly.\n\n${chunk.srt}` }] }); return message.content.map(x => x.text || '').join('').replace(/^```(?:srt|text)?\s*/i, '').replace(/\s*```$/i, '').trim(); }
-async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const translated = []; let previous = ''; for (const chunk of chunkSrt(source)) { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context, previous)); translated.push(...result); previous = result.slice(-3).map(e => e.text).join('\n'); } const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
+async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL || 'auto'}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const chunks = chunkSrt(source); console.log(`[translation] ${imdbId}: ${chunks.length} chunks, concurrency=${TRANSLATION_CONCURRENCY}`); const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async (chunk, index) => { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context, '')); console.log(`[translation] ${imdbId}: chunk ${index + 1}/${chunks.length} complete`); return result; }); const translated = translatedChunks.flat(); const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
+async function runWithConcurrency(items, concurrency, worker) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be at least 1');
+  const results = new Array(items.length);
+  let next = 0;
+  async function consume() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, consume));
+  return results;
+}
 function buildPlaceholderSrt() {
   return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.';
 }
@@ -111,4 +126,4 @@ function createApp() {
   return app;
 }
 if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
-module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter };
+module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter, runWithConcurrency };
