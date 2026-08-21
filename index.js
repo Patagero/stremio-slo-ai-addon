@@ -83,7 +83,9 @@ async function translateSubtitle(imdbId, sourceLanguage) {
 }
 function manifest() { return addonManifest; }
 function createApp() {
-  const app = express(); app.use(express.json({ limit: '1mb' }));
+  const app = express();
+  app.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Methods', 'GET,OPTIONS'); res.set('Access-Control-Allow-Headers', 'Content-Type'); if (req.method === 'OPTIONS') return res.sendStatus(204); return next(); });
+  app.use(express.json({ limit: '1mb' }));
   app.get('/manifest.json', (_req, res) => res.json(manifest())); app.get('/manifest', (_req, res) => res.json(manifest()));
   app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, anthropicConfigured: Boolean(anthropic), tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables.</p>'));
