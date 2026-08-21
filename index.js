@@ -16,6 +16,10 @@ const ANTHROPIC_API_VERSION = process.env.ANTHROPIC_API_VERSION || '2023-06-01';
 const ANTHROPIC_BETA_MODEL = process.env.ANTHROPIC_BETA_MODEL || '';
 const cache = new Map();
 const inflight = new Map();
+const completed = new Map();
+const jobs = new Map();
+const subtitleFiles = new Map();
+function buildPlaceholderSrt() { return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.'; }
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 const addonManifest = { id: 'com.stremio.slo.ai.translator', version: '0.2.1', name: 'Slo AI Subtitle Translator', description: 'English, Croatian and Italian subtitles translated to Slovenian with TMDB context and gender-aware review.', resources: ['subtitles'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs: [], behaviorHints: { configurable: true, configurationRequired: false } };
 
@@ -33,36 +37,53 @@ function selectAnthropicModel(models = []) { const ids = models.map(model => Str
 async function resolveAnthropicModel() { if (resolvedAnthropicModel) return resolvedAnthropicModel; if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const result = await anthropic.models.list({ limit: 100 }); resolvedAnthropicModel = selectAnthropicModel(result.data || []); if (!resolvedAnthropicModel) throw new Error('Anthropic account exposes no usable models'); console.log(`[anthropic] selected model ${resolvedAnthropicModel}`); return resolvedAnthropicModel; }
 async function translateChunk(chunk, context, previous = '') { if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const message = await anthropic.messages.create({ model: await resolveAnthropicModel(), max_tokens: 8192, temperature: 0.1, system: systemPrompt(`${context}\nPrevious translated context:\n${previous || 'None'}`), messages: [{ role: 'user', content: `Translate this SRT chunk. Preserve every number and timestamp exactly.\n\n${chunk.srt}` }] }); return message.content.map(x => x.text || '').join('').replace(/^```(?:srt|text)?\s*/i, '').replace(/\s*```$/i, '').trim(); }
 async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const translated = []; let previous = ''; for (const chunk of chunkSrt(source)) { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context, previous)); translated.push(...result); previous = result.slice(-3).map(e => e.text).join('\n'); } const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
+function buildPlaceholderSrt() {
+  return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.';
+}
+function buildErrorSrt(message) {
+  const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180);
+  return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`;
+}
 function manifest() { return addonManifest; }
 function createApp() {
   const app = express();
   const baseUrl = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  const subtitleFiles = new Map();
   app.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Methods', 'GET,OPTIONS'); res.set('Access-Control-Allow-Headers', 'Content-Type'); if (req.method === 'OPTIONS') return res.sendStatus(204); console.log(`[request] ${req.method} ${req.originalUrl}`); return next(); });
   app.use(express.json({ limit: '1mb' }));
   app.get('/manifest.json', (_req, res) => res.json(manifest()));
   app.get('/manifest', (_req, res) => res.json(manifest()));
-  app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, anthropicConfigured: Boolean(anthropic), anthropicModel: resolvedAnthropicModel || 'auto-detect', tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
+  app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, processingJobs: jobs.size, completedJobs: completed.size, anthropicConfigured: Boolean(anthropic), anthropicModel: resolvedAnthropicModel || 'auto-detect', tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables.</p>'));
   app.get('/subtitle-file/:token.srt', (req, res) => { const srt = subtitleFiles.get(req.params.token); if (!srt) return res.sendStatus(404); return res.type('application/x-subrip; charset=utf-8').send(srt); });
-  app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, async (req, res) => {
-    try {
-      const type = req.params[0];
-      const rawId = req.params[1];
-      const imdbId = rawId.replace(/\.json$/i, '');
-      const sourceLanguage = String(req.query.sourceLanguage || 'en').toLowerCase();
-      const srt = await translateSubtitle(imdbId, sourceLanguage);
+  app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
+    console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
+    const type = req.params[0];
+    const rawId = req.params[1];
+    const imdbId = rawId.replace(/\.json$/i, '');
+    const sourceLanguage = String(req.query.sourceLanguage || 'en').toLowerCase();
+    const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL || 'auto'}`;
+    const root = baseUrl || `${req.protocol}://${req.get('host')}`;
+    const publish = (srt, label = 'Slovenian AI') => {
       const token = crypto.randomUUID();
       subtitleFiles.set(token, srt);
       setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      const root = baseUrl || `${req.protocol}://${req.get('host')}`;
-      return res.json({ subtitles: [{ id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label: 'Slovenian AI' }] });
-    } catch (error) {
-      console.error(`[translation] ${error.message}`);
-      return res.json({ subtitles: [], error: error.message });
+      return { id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ subtitles: [publish(cached.srt)] });
     }
+    if (!jobs.has(key)) {
+      jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
+      Promise.resolve().then(() => translateSubtitle(imdbId, sourceLanguage))
+        .then(srt => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
+        .catch(error => { jobs.get(key).error = error.message; jobs.get(key).status = 'failed'; console.error(`[translation] ${error.message}`); })
+        .finally(() => { const job = jobs.get(key); if (job?.status === 'processing') job.status = 'completed'; });
+    }
+    return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)')] });
   });
+  app.get('/jobs/:jobKey', (req, res) => { const key = decodeURIComponent(req.params.jobKey); return res.json(jobs.get(key) || completed.get(key) || { status: 'unknown' }); });
   return app;
 }
 if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
-module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel };
+module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt };
