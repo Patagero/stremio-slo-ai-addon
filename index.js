@@ -37,21 +37,29 @@ async function fetchOpenSubtitle(imdbId, language) { if (!process.env.OPENSUBTIT
 async function translateWithGemini(system, srt, options = {}) { const apiKey = options.apiKey || GEMINI_API_KEY; const model = options.model || GEMINI_MODEL; const fetchImpl = options.fetchImpl || fetch; if (!apiKey) throw new Error('GEMINI_API_KEY is not configured'); const request = buildGeminiRequest(system, srt, model); const response = await fetchImpl(`${request.url}?key=${encodeURIComponent(apiKey)}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request.body) }); if (!response.ok) { const detail = await response.text(); throw new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`); } const data = await response.json(); return data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('').replace(/^```(?:srt|text)?\s*/i, '').replace(/\s*```$/i, '').trim() || ''; }
 function buildGeminiRequest(system, srt, model = GEMINI_MODEL) { return { url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, body: { contents: [{ role: 'user', parts: [{ text: `${system}\n\nINPUT SUBTITLES:\n${srt}` }] }], generationConfig: { temperature: 0.1 } } }; }
 async function translateChunk(chunk, context, previous = '') {
-  const prompt = `${systemPrompt(context)}\n\nPREVIOUS TRANSLATION CONTEXT:\n${previous || 'None'}\n\nBefore answering, count every SRT cue in INPUT SUBTITLES. Return exactly the same cue IDs and timestamps in the same order. Do not omit even a short cue such as Yes, No or Okay.`;
-  let candidate = await translateWithGemini(prompt, chunk.srt);
-  try { parseAndValidateSrt(chunk.srt, candidate); return candidate; } catch (firstError) {
-    console.warn(`[translation] chunk ${chunk.index + 1} failed validation (${firstError.message}); requesting repair`);
-    const repair = `${prompt}\n\nREPAIR TASK: The candidate below is invalid. Reconstruct the complete SRT. Copy every cue number and timestamp from the source exactly, translate every cue, and output only the corrected SRT.\n\nSOURCE SRT:\n${chunk.srt}\n\nINVALID CANDIDATE:\n${candidate}`;
-    candidate = await translateWithGemini(repair, chunk.srt);
-        try {
-          parseAndValidateSrt(chunk.srt, candidate);
-          return candidate;
-        } catch (repairError) {
-          const reconciled = reconcileTranslatedSrt(chunk.srt, candidate);
-          console.warn(`[translation] chunk ${chunk.index + 1} repaired locally after AI repair (${repairError.message})`);
-          return reconciled;
-        }
+  const sourceEntries = chunk.entries || parseSrt(chunk.srt);
+  const sourceText = sourceEntries.map(entry => `[${entry.id}] ${entry.text}`).join('\n');
+  const prompt = `${systemPrompt(context)}\n\nReturn ONLY a JSON array with exactly one object for every source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Include short cues, never merge or omit entries, and do not include timestamps.\n\nSOURCE CUES:\n${sourceText}\n\nPREVIOUS TRANSLATION CONTEXT:\n${previous || 'None'}`;
+  const response = await translateWithGemini(prompt, sourceText);
+  const translated = parseTranslationJson(response);
+  if (translated && translated.size === sourceEntries.length) {
+    return toSrt(sourceEntries.map(entry => ({ id: entry.id, timecode: entry.timecode, text: translated.get(String(entry.id)) || entry.text })));
   }
+  console.warn(`[translation] chunk ${chunk.index + 1} incomplete; using one repair request`);
+  const repaired = await translateWithGemini(`${prompt}\n\nREPAIR: return every source ID exactly once.`, sourceText);
+  const repairedMap = parseTranslationJson(repaired);
+  return toSrt(sourceEntries.map(entry => ({ id: entry.id, timecode: entry.timecode, text: repairedMap?.get(String(entry.id)) || entry.text })));
+}
+function parseTranslationJson(value) {
+  try {
+    let cleaned = String(value || '').replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
+    const start = cleaned.indexOf('['); const end = cleaned.lastIndexOf(']');
+    if (start >= 0 && end > start) cleaned = cleaned.slice(start, end + 1);
+    const data = JSON.parse(cleaned); if (!Array.isArray(data)) return null;
+    const map = new Map();
+    for (const item of data) if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+    return map;
+  } catch (_) { return null; }
 }
 async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:gemini:${GEMINI_MODEL}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const chunks = chunkSrt(source); console.log(`[translation] ${imdbId}: ${chunks.length} chunks, concurrency=${TRANSLATION_CONCURRENCY}, model=${GEMINI_MODEL}`); const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async (chunk, index) => { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context)); console.log(`[translation] ${imdbId}: chunk ${index + 1}/${chunks.length} complete`); return result; }); const translated = translatedChunks.flat(); const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); console.log(`[translation] ${imdbId}: completed ${translated.length} cues`); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
 async function runWithConcurrency(items, concurrency, worker) { if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be at least 1'); const results = new Array(items.length); let next = 0; async function consume() { while (true) { const index = next++; if (index >= items.length) return; results[index] = await worker(items[index], index); } } await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, consume)); return results; }
