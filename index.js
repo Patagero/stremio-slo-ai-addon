@@ -23,7 +23,9 @@ const completed = new Map();
 const jobs = new Map();
 const subtitleFiles = new Map();
 function buildPlaceholderSrt() { return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.'; }
-const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const anthropic = null;
 const addonManifest = { id: 'com.stremio.slo.ai.translator', version: '0.2.1', name: 'Slo AI Subtitle Translator', description: 'English, Croatian and Italian subtitles translated to Slovenian with TMDB context and gender-aware review.', resources: ['subtitles'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs: [], behaviorHints: { configurable: true, configurationRequired: false } };
 
 function parseSrt(srt) {
@@ -39,7 +41,7 @@ async function fetchOpenSubtitle(imdbId, language) { if (!process.env.OPENSUBTIT
 function selectAnthropicModel(models = []) { const ids = models.map(model => String(model.id || model.name || '')).filter(Boolean); const preferred = FAST_TRANSLATION ? [/claude-haiku-4/i, /claude-3-5-haiku/i, /claude-sonnet-4/i, /claude-3-7-sonnet/i, /claude-3-5-sonnet/i, /claude-sonnet/i] : [/claude-sonnet-4/i, /claude-3-7-sonnet/i, /claude-3-5-sonnet/i, /claude-sonnet/i, /claude-haiku-4/i, /claude-3-5-haiku/i]; for (const pattern of preferred) { const match = ids.find(id => pattern.test(id)); if (match) return match; } return ids[0] || null; }
 async function resolveAnthropicModel() { if (resolvedAnthropicModel) return resolvedAnthropicModel; if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const result = await anthropic.models.list({ limit: 100 }); resolvedAnthropicModel = selectAnthropicModel(result.data || []); if (!resolvedAnthropicModel) throw new Error('Anthropic account exposes no usable models'); console.log(`[anthropic] selected model ${resolvedAnthropicModel}`); return resolvedAnthropicModel; }
 async function translateChunk(chunk, context, previous = '') { if (!anthropic) throw new Error('ANTHROPIC_API_KEY is not configured'); const message = await anthropic.messages.create({ model: await resolveAnthropicModel(), max_tokens: 8192, temperature: 0.1, system: systemPrompt(`${context}\nPrevious translated context:\n${previous || 'None'}`), messages: [{ role: 'user', content: `Translate this SRT chunk. Preserve every number and timestamp exactly.\n\n${chunk.srt}` }] }); return message.content.map(x => x.text || '').join('').replace(/^```(?:srt|text)?\s*/i, '').replace(/\s*```$/i, '').trim(); }
-async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL || 'auto'}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const chunks = chunkSrt(source); console.log(`[translation] ${imdbId}: ${chunks.length} chunks, concurrency=${TRANSLATION_CONCURRENCY}`); const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async (chunk, index) => { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context, '')); console.log(`[translation] ${imdbId}: chunk ${index + 1}/${chunks.length} complete`); return result; }); const translated = translatedChunks.flat(); const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); console.log(`[translation] ${imdbId}: completed ${translated.length} cues`); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
+async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:gemini:${GEMINI_MODEL}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const chunks = chunkSrt(source); console.log(`[translation] ${imdbId}: ${chunks.length} chunks, concurrency=${TRANSLATION_CONCURRENCY}`); const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async (chunk, index) => { const result = parseAndValidateSrt(chunk.srt, await translateChunk(chunk, context, '')); console.log(`[translation] ${imdbId}: chunk ${index + 1}/${chunks.length} complete`); return result; }); const translated = translatedChunks.flat(); const srt = toSrt(parseAndValidateSrt(source, toSrt(translated))); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); console.log(`[translation] ${imdbId}: completed ${translated.length} cues`); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
 async function runWithConcurrency(items, concurrency, worker) {
   if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be at least 1');
   const results = new Array(items.length);
@@ -82,7 +84,7 @@ function createApp() {
   app.use(express.json({ limit: '1mb' }));
   app.get('/manifest.json', (_req, res) => res.json(manifest()));
   app.get('/manifest', (_req, res) => res.json(manifest()));
-  app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, processingJobs: jobs.size, completedJobs: completed.size, anthropicConfigured: Boolean(anthropic), anthropicModel: resolvedAnthropicModel || 'auto-detect', fastTranslation: FAST_TRANSLATION, chunkSize: CHUNK_SIZE, concurrency: TRANSLATION_CONCURRENCY, fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS, tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
+  app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, processingJobs: jobs.size, completedJobs: completed.size, geminiConfigured: Boolean(GEMINI_API_KEY), geminiModel: GEMINI_MODEL, fastTranslation: FAST_TRANSLATION, chunkSize: CHUNK_SIZE, concurrency: TRANSLATION_CONCURRENCY, fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS, tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) }));
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables.</p>'));
   app.get('/subtitle-file/:token.srt', async (req, res) => {
     const file = subtitleFiles.get(req.params.token);
@@ -103,7 +105,7 @@ function createApp() {
     const rawId = req.params[1];
     const imdbId = rawId.replace(/\.json$/i, '');
     const sourceLanguage = String(req.query.sourceLanguage || 'en').toLowerCase();
-    const key = `${imdbId}:${sourceLanguage}:slv:${ANTHROPIC_MODEL || 'auto'}`;
+    const key = `${imdbId}:${sourceLanguage}:slv:gemini:${GEMINI_MODEL}`;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const publish = (srt, label = 'Slovenian AI', status = 'ready') => {
       const token = crypto.randomUUID();
@@ -128,4 +130,10 @@ function createApp() {
   return app;
 }
 if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
-module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter, runWithConcurrency, CHUNK_SIZE, TRANSLATION_CONCURRENCY, SUBTITLE_FILE_TIMEOUT_MS };
+function buildGeminiRequest(system, srt) {
+  return {
+    url: `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    body: { contents: [{ role: 'user', parts: [{ text: `${system}\n\n${srt}` }] }], generationConfig: { temperature: 0.1 } }
+  };
+}
+module.exports = { chunkSrt, parseAndValidateSrt, buildMetadataContext, manifest, createApp, systemPrompt, selectAnthropicModel, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter, runWithConcurrency, CHUNK_SIZE, TRANSLATION_CONCURRENCY, SUBTITLE_FILE_TIMEOUT_MS, GEMINI_MODEL, providerConfig: { name: 'gemini', model: GEMINI_MODEL }, buildGeminiRequest };
