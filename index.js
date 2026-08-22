@@ -19,7 +19,7 @@ const completed = new Map();
 const jobs = new Map();
 const subtitleFiles = new Map();
 function selectAnthropicModel() { return null; }
-const addonManifest = { id: 'com.stremio.slo.ai.translator', version: '0.3.0', name: 'Slo AI Subtitle Translator', description: 'High-quality English, Croatian and Italian to Slovenian subtitles with metadata and gender-aware translation.', resources: ['subtitles'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs: [], behaviorHints: { configurable: true, configurationRequired: false } };
+const addonManifest = { id: 'com.stremio.slo.ai.translator', version: '0.3.1', name: 'Slo AI Subtitle Translator', description: 'High-quality English, Croatian and Italian to Slovenian subtitles with metadata and gender-aware translation.', resources: ['subtitles'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs: [], behaviorHints: { configurable: true, configurationRequired: false } };
 
 function parseSrt(srt) { return srtParser.fromSrt(String(srt || '').replace(/\r/g, '')).map((entry, index) => ({ id: String(entry.id ?? index + 1), timecode: `${entry.startTime} --> ${entry.endTime}`, text: String(entry.text || '').trim() })); }
 function toSrt(entries) { return srtParser.toSrt(entries.map(e => ({ id: e.id, startTime: e.timecode.split(' --> ')[0], endTime: e.timecode.split(' --> ')[1], text: e.text }))); }
