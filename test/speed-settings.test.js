@@ -11,5 +11,5 @@ test('speed settings use large chunks, bounded parallelism, and a long file time
 test('fast translation uses the configured Gemini provider', () => {
   const { providerConfig } = require('../index');
   assert.equal(providerConfig.name, 'gemini');
-  assert.match(providerConfig.model, /^gemini-/);
+  assert.equal(providerConfig.model, 'gemini-3.6-flash');
 });

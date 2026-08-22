@@ -30,7 +30,7 @@ test('Gemini provider is used and receives the current SRT chunk', async () => {
   });
   assert.equal(result.includes('Živjo'), true);
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /gemini-2\.5-flash:generateContent/);
+  assert.match(calls[0].url, /gemini-3\.6-flash:generateContent/);
   assert.match(calls[0].options.body, /Hello/);
 });
 

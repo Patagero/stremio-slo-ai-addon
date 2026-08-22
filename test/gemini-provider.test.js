@@ -4,7 +4,7 @@ const { providerConfig, buildGeminiRequest } = require('../index');
 
 test('uses Gemini as the translation provider', () => {
   assert.equal(providerConfig.name, 'gemini');
-  assert.equal(providerConfig.model, 'gemini-2.5-flash');
+  assert.equal(providerConfig.model, 'gemini-3.6-flash');
 });
 
 test('builds a Gemini request with the Slovenian prompt and SRT content', () => {
@@ -12,5 +12,5 @@ test('builds a Gemini request with the Slovenian prompt and SRT content', () => 
   assert.equal(request.body.generationConfig.temperature, 0.1);
   assert.match(request.body.contents[0].parts[0].text, /SYSTEM PROMPT/);
   assert.match(request.body.contents[0].parts[0].text, /Hello/);
-  assert.equal(request.url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent');
+  assert.equal(request.url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent');
 });

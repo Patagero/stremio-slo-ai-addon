@@ -10,7 +10,7 @@ const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FI
 const FAST_TRANSLATION = process.env.FAST_TRANSLATION !== 'false';
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const providerConfig = { name: 'gemini', model: GEMINI_MODEL };
 const cache = new Map();
 const inflight = new Map();
