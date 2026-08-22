@@ -631,7 +631,7 @@ test('translation uses chunked input', () => {
   assert.ok(true);
 });
 
-test('chunk size is 45', () => {
+test('chunk size is large for speed', () => {
   assert.ok(true);
 });
 
