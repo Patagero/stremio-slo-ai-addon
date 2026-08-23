@@ -440,9 +440,10 @@ async function translateSubtitle(imdbId, sourceLanguage) {
     const characters = await analyzeCharacters(source, meta);
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
 
-    const fullChunk = { index: 0, entries: parseSrt(source), srt: source };
-    console.log(`[translation] ${imdbId}: full subtitle in one request, cues=${fullChunk.entries.length}, model=${ANTHROPIC_MODEL}`);
-    const srt = await translateChunk(fullChunk, context);
+    const chunks = chunkSrt(source, CHUNK_SIZE);
+    console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${ANTHROPIC_MODEL}`);
+    const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, chunk => translateChunk(chunk, context));
+    const srt = translatedChunks.join('\n\n');
     const validated = reconcileTranslatedSrt(source, srt);
     parseAndValidateSrt(source, validated);
 
