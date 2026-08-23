@@ -28,6 +28,10 @@ const inflight = new Map();
 const completed = new Map();
 const jobs = new Map();
 const subtitleFiles = new Map();
+// Progressive translation state: jobKey -> { entryMap, order, totalChunks, doneChunks }
+// Lets us serve "chunk 1 already done, rest still in the source language" instead of
+// making the player wait for the whole film to finish translating.
+const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
@@ -442,12 +446,23 @@ async function translateSubtitle(imdbId, sourceLanguage) {
 
     const chunks = chunkSrt(source, CHUNK_SIZE);
     console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${ANTHROPIC_MODEL}`);
-    const translatedChunks = await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, chunk => translateChunk(chunk, context));
-    const srt = translatedChunks.join('\n\n');
+
+    const partial = createPartialTracker(parseSrt(source), chunks.length);
+    partials.set(key, partial);
+
+    await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async chunk => {
+      const chunkSrtResult = await translateChunk(chunk, context);
+      mergeChunkIntoPartial(partial, chunkSrtResult);
+      console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunks}/${chunks.length} total)`);
+      return chunkSrtResult;
+    });
+
+    const srt = partialToSrt(partial);
     const validated = reconcileTranslatedSrt(source, srt);
     parseAndValidateSrt(source, validated);
 
     cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    partials.delete(key);
     console.log(`[translation] ${imdbId}: completed ${parseSrt(validated).length} cues`);
     return validated;
   })();
@@ -473,6 +488,32 @@ async function runWithConcurrency(items, concurrency, worker) {
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, consume));
   return results;
+}
+
+// ---------- Progressive ("watch while it translates") state ----------
+
+function createPartialTracker(sourceEntries, totalChunks) {
+  return {
+    entryMap: new Map(sourceEntries.map(e => [e.id, { timecode: e.timecode, text: e.text }])),
+    order: sourceEntries.map(e => e.id),
+    totalChunks,
+    doneChunks: 0
+  };
+}
+
+function mergeChunkIntoPartial(partial, chunkSrtText) {
+  const entries = parseSrt(chunkSrtText);
+  for (const entry of entries) partial.entryMap.set(entry.id, { timecode: entry.timecode, text: entry.text });
+  partial.doneChunks += 1;
+  return partial;
+}
+
+function partialToSrt(partial) {
+  const entries = partial.order.map(id => {
+    const entry = partial.entryMap.get(id);
+    return { id, timecode: entry.timecode, text: entry.text };
+  });
+  return toSrt(entries);
 }
 
 function buildPlaceholderSrt() {
@@ -536,19 +577,34 @@ function createApp() {
 
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
 
-  app.get('/subtitle-file/:token.srt', async (req, res) => {
+  app.get('/subtitle-file/:token.srt', (req, res) => {
     const file = subtitleFiles.get(req.params.token);
     if (!file) return res.sendStatus(404);
-    if (file.status === 'ready') return res.type('application/x-subrip; charset=utf-8').send(file.srt);
-    try {
-      const srt = await createSubtitleFileWaiter({ cache, jobs })(file.jobKey);
+
+    // 1) Fully translated and cached — best case.
+    const finalEntry = cache.get(file.jobKey);
+    if (finalEntry && finalEntry.expiresAt > Date.now()) {
       file.status = 'ready';
-      file.srt = srt;
-      return res.type('application/x-subrip; charset=utf-8').send(srt);
-    } catch (error) {
-      console.error(`[translation-file] ${error.message}`);
-      return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message));
+      file.srt = finalEntry.srt;
+      return res.type('application/x-subrip; charset=utf-8').send(finalEntry.srt);
     }
+
+    // 2) Translation in progress — serve whatever chunks are done so far so the player
+    //    never has to wait for the whole file. Cues not yet translated stay in the
+    //    source language until a later request picks up the finished version.
+    const partial = partials.get(file.jobKey);
+    if (partial) {
+      return res.type('application/x-subrip; charset=utf-8').send(partialToSrt(partial));
+    }
+
+    // 3) Job failed before any chunk finished.
+    const job = jobs.get(file.jobKey);
+    if (job?.status === 'failed') {
+      return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(job.error));
+    }
+
+    // 4) Job just started, nothing to show yet (should only last a second or two).
+    return res.type('application/x-subrip; charset=utf-8').send(buildPlaceholderSrt());
   });
 
   app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
@@ -618,5 +674,8 @@ module.exports = {
   maxCharsForDuration,
   findTooFastCues,
   TARGET_CPS,
-  MAX_LINE_CHARS
+  MAX_LINE_CHARS,
+  createPartialTracker,
+  mergeChunkIntoPartial,
+  partialToSrt
 };
