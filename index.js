@@ -221,7 +221,6 @@ function buildClaudeRequest(system, userText, model = ANTHROPIC_MODEL, maxTokens
     body: {
       model,
       max_tokens: maxTokens,
-      temperature: 0.1,
       system,
       messages: [{ role: 'user', content: userText }]
     }
