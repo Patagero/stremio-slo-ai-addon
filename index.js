@@ -8,65 +8,615 @@ const PORT = Number(process.env.PORT || 7002);
 const CHUNK_SIZE = Math.max(40, Math.min(50, Number(process.env.CHUNK_SIZE || 45)));
 const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.TRANSLATION_CONCURRENCY || 1)));
 const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FILE_TIMEOUT_MS || 300000));
-const FAST_TRANSLATION = process.env.FAST_TRANSLATION !== 'false';
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
-const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-const providerConfig = { name: 'gemini', model: GEMINI_MODEL };
+
+const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim();
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+const providerConfig = { name: 'anthropic', model: ANTHROPIC_MODEL };
+
+// Ciljna hitrost branja (characters per second). 17 CPS je standardni okvir za odrasle gledalce
+// (Netflix/BBC uporabljata podobne vrednosti). Nižje je počasneje/bolj berljivo.
+const TARGET_CPS = Number(process.env.TARGET_CPS || 17);
+const MAX_LINE_CHARS = Number(process.env.MAX_LINE_CHARS || 42);
+const MAX_LINES = 2;
+
+// Jeziki, ki jih ta addon zna prevesti v slovenščino, po prioriteti iskanja na OpenSubtitles.
+const SUPPORTED_SOURCE_LANGUAGES = ['en', 'hr', 'it'];
+
 const cache = new Map();
 const inflight = new Map();
 const completed = new Map();
 const jobs = new Map();
 const subtitleFiles = new Map();
-function selectAnthropicModel() { return null; }
-const addonManifest = { id: 'com.stremio.slo.ai.translator', version: '0.4.0', name: 'Slo AI Subtitle Translator', description: 'High-quality English, Croatian and Italian to Slovenian subtitles with metadata and gender-aware translation.', resources: ['subtitles'], types: ['movie', 'series'], idPrefixes: ['tt'], catalogs: [], behaviorHints: { configurable: true, configurationRequired: false } };
 
-function parseSrt(srt) { return srtParser.fromSrt(String(srt || '').replace(/\r/g, '')).map((entry, index) => ({ id: String(entry.id ?? index + 1), timecode: `${entry.startTime} --> ${entry.endTime}`, text: String(entry.text || '').trim() })); }
-function toSrt(entries) { return srtParser.toSrt(entries.map(e => ({ id: e.id, startTime: e.timecode.split(' --> ')[0], endTime: e.timecode.split(' --> ')[1], text: e.text }))); }
-function chunkSrt(srt, chunkSize = CHUNK_SIZE) { const entries = parseSrt(srt); const chunks = []; for (let i = 0; i < entries.length; i += chunkSize) chunks.push({ index: chunks.length, entries: entries.slice(i, i + chunkSize), srt: toSrt(entries.slice(i, i + chunkSize)) }); return chunks; }
-function parseAndValidateSrt(source, translated) { const original = parseSrt(source); const result = parseSrt(translated); if (!original.length || original.length !== result.length) throw new Error(`Invalid translated SRT entry count: ${result.length}/${original.length}`); for (let i = 0; i < original.length; i += 1) if (original[i].id !== result[i].id || original[i].timecode !== result[i].timecode || !result[i].text) throw new Error(`Invalid SRT structure at cue ${i + 1}`); return result; }
-function reconcileTranslatedSrt(source, candidate) { const original = parseSrt(source); const translated = parseSrt(candidate); if (!original.length) throw new Error('Invalid source SRT'); const byId = new Map(translated.map(entry => [String(entry.id), entry])); const repaired = original.map(entry => { const found = byId.get(String(entry.id)); return { id: entry.id, timecode: entry.timecode, text: found?.text?.trim() || entry.text }; }); return toSrt(repaired); }
-function validateSlovenianSubtitle(text) { return String(text || '').split('\n').length <= 2 && String(text || '').split('\n').every(line => line.length <= 40); }
-function buildMetadataContext(meta = {}) { const gender = { 1: 'Female', 2: 'Male' }; const characters = (meta.credits || []).map(c => `${c.name}: ${gender[c.gender] || 'Unknown'}`).join('\n') || 'No character gender metadata available.'; return `Title: ${meta.title || 'Unknown'}\nPlot: ${meta.overview || 'Not provided'}\nCharacter Genders & Relationships:\n${characters}`; }
-function buildPrompt(title, plot, characters, srt) {
-  return `You are an elite, professional subtitle translator and localizer specializing in English/Croatian/Italian to natural Slovenian translation.\n\nCONTEXT:\n- Title: ${title || 'Unknown'}\n- Plot: ${plot || 'Not provided'}\n- Character Genders & Relationships:\n${characters || 'Not provided'}\n\nCORE TRANSLATION & SUBTITLE RULES:\n1. READABILITY & LENGTH CONTROL (CRITICAL): Keep translated lines concise. Aim for 37-40 characters per line and no more than 2 lines per subtitle block. Condense wordy literal translations while preserving meaning.\n2. GENDER & CONTEXT ACCURACY (ON/ONA): Analyze the entire conversation flow first to understand who is speaking to whom. Maintain consistent grammatical gender for every character throughout the entire file. Use rekla sem/prišla sem/bila sem for female and rekel sem/prišel sem/bil sem for male. Use correct second-person forms si videla/videl and si pripravljena/pripravljen. Distinguish speaker and addressee gender; never infer gender from voice alone.\n3. NATURAL LOCALIZED LANGUAGE: Avoid robotic literal translation. Localize idioms, slang and banter. Keep tikanje/vikanje consistent.\n4. PERFECT SRT SYNTAX & STRUCTURAL INTEGRITY: Retain every line number and timestamp exactly. Do not skip, merge, split, re-index, reorder or omit blocks. Output ONLY raw translated SRT without markdown or commentary.\n\nINPUT SUBTITLES:\n${srt}`;
+const addonManifest = {
+  id: 'com.stremio.slo.ai.translator',
+  version: '0.5.0',
+  name: 'Slo AI Subtitle Translator',
+  description: 'High-quality English, Croatian and Italian to Slovenian subtitles with two-pass, gender-aware AI translation (Claude).',
+  resources: ['subtitles'],
+  types: ['movie', 'series'],
+  idPrefixes: ['tt'],
+  catalogs: [],
+  behaviorHints: { configurable: true, configurationRequired: false }
+};
+
+// ---------- SRT parsing / building helpers ----------
+
+function parseSrt(srt) {
+  return srtParser.fromSrt(String(srt || '').replace(/\r/g, '')).map((entry, index) => ({
+    id: String(entry.id ?? index + 1),
+    timecode: `${entry.startTime} --> ${entry.endTime}`,
+    text: String(entry.text || '').trim()
+  }));
 }
-function systemPrompt(context) { return `You are an elite, professional subtitle translator and localizer specializing in English/Croatian/Italian to natural Slovenian translation.\n\nCONTEXT:\n${context}\n\nCORE TRANSLATION & SUBTITLE RULES:\n\n1. READABILITY & LENGTH CONTROL (CRITICAL):\n- Keep translated lines concise and natural to read.\n- Aim for a maximum of 37-40 characters per line and no more than 2 lines per subtitle block.\n- Condense and simplify wordy literal translations while preserving the complete meaning.\n\n2. GENDER & CONTEXT ACCURACY (ON/ONA):\n- Analyze the conversation flow and identify who speaks to whom.\n- Maintain a private stable gender ledger for each character across the entire file.\n- Never infer gender from voice alone. Use metadata, names, relationships, explicit references, dialogue and grammar.\n- Apply correct Slovenian first-person forms: female rekla sem, prišla sem, bila sem; male rekel sem, prišel sem, bil sem.\n- Apply correct second-person forms: si videla/videl, si pripravljena/pripravljen.\n- Distinguish speaker gender from addressee gender. If evidence is insufficient, do not invent a gendered fact; use natural wording that avoids unsupported gender.\n\n3. NATURAL LOCALIZED LANGUAGE:\n- Avoid robotic literal translations. Localize idioms, slang, banter and dynamic expressions into modern conversational Slovenian.\n- Preserve tone, humour, emotion and relationships. Keep tikanje/vikanje consistent.\n\n4. PERFECT SRT SYNTAX & STRUCTURAL INTEGRITY:\n- Retain ALL original line numbers and timestamps EXACTLY.\n- Do NOT skip, merge, split, re-index, reorder or omit blocks.\n- Output ONLY raw translated SRT text, with no markdown, introductions or commentary.`; }
-async function tmdbMetadata(imdbId) { if (!process.env.TMDB_API_KEY) return { title: imdbId, overview: 'Not provided', credits: [] }; const base = 'https://api.themoviedb.org/3'; const find = await axios.get(`${base}/find/${encodeURIComponent(imdbId)}`, { params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', external_source: 'imdb_id' } }); const item = find.data.movie_results?.[0] || find.data.tv_results?.[0]; if (!item) return { title: imdbId, overview: 'Not provided', credits: [] }; const type = find.data.movie_results?.length ? 'movie' : 'tv'; const details = await axios.get(`${base}/${type}/${item.id}`, { params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', append_to_response: 'credits' } }); return { title: details.data.title || details.data.name || imdbId, overview: details.data.overview || 'Not provided', credits: (details.data.credits?.cast || []).slice(0, 20).map(c => ({ name: c.character ? `${c.character} (${c.name})` : c.name, gender: c.gender })) }; }
-async function fetchOpenSubtitle(imdbId, language) { if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured'); const headers = { 'Api-Key': process.env.OPENSUBTITLES_API_KEY, 'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.3.0', Accept: 'application/json' }; const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', { headers, params: { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' } }); const file = search.data.data?.[0]?.attributes?.files?.[0]; if (!file?.file_id) throw new Error(`No ${language} subtitle found`); const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers }); if (!download.data.link) throw new Error('OpenSubtitles returned no download link'); return (await axios.get(download.data.link)).data; }
-async function translateWithGemini(system, srt, options = {}) { const apiKey = options.apiKey || GEMINI_API_KEY; const model = options.model || GEMINI_MODEL; const fetchImpl = options.fetchImpl || fetch; if (!apiKey) throw new Error('GEMINI_API_KEY is not configured'); const request = buildGeminiRequest(system, srt, model); const response = await fetchImpl(`${request.url}?key=${encodeURIComponent(apiKey)}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request.body) }); if (!response.ok) { const detail = await response.text(); throw new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`); } const data = await response.json(); return data.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('').replace(/^```(?:srt|text)?\s*/i, '').replace(/\s*```$/i, '').trim() || ''; }
-function buildGeminiRequest(system, srt, model = GEMINI_MODEL) { return { url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, body: { contents: [{ role: 'user', parts: [{ text: `${system}\n\nINPUT SUBTITLES:\n${srt}` }] }], generationConfig: { temperature: 0.1, responseMimeType: 'application/json' } } }; }
-async function translateChunk(chunk, context, previous = '') {
-  const sourceEntries = chunk.entries || parseSrt(chunk.srt);
-  const sourceText = sourceEntries.map(entry => `[${entry.id}] ${entry.text}`).join('\n');
-  const prompt = `${systemPrompt(context)}\n\nReturn ONLY a JSON array with exactly one object for every source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Include short cues, never merge or omit entries, and do not include timestamps.\n\nSOURCE CUES:\n${sourceText}\n\nPREVIOUS TRANSLATION CONTEXT:\n${previous || 'None'}`;
-  const response = await translateWithGemini(prompt, sourceText);
-  const translated = parseTranslationJson(response);
-  if (translated && translated.size === sourceEntries.length) {
-    return toSrt(sourceEntries.map(entry => ({ id: entry.id, timecode: entry.timecode, text: translated.get(String(entry.id)) || entry.text })));
+
+function toSrt(entries) {
+  return srtParser.toSrt(entries.map(e => ({
+    id: e.id,
+    startTime: e.timecode.split(' --> ')[0],
+    endTime: e.timecode.split(' --> ')[1],
+    text: e.text
+  })));
+}
+
+function chunkSrt(srt, chunkSize = CHUNK_SIZE) {
+  const entries = parseSrt(srt);
+  const chunks = [];
+  for (let i = 0; i < entries.length; i += chunkSize) {
+    const slice = entries.slice(i, i + chunkSize);
+    chunks.push({ index: chunks.length, entries: slice, srt: toSrt(slice) });
   }
-  console.warn(`[translation] chunk ${chunk.index + 1} incomplete; using one repair request`);
-  const repaired = await translateWithGemini(`${prompt}\n\nREPAIR: return every source ID exactly once.`, sourceText);
-  const repairedMap = parseTranslationJson(repaired);
-  return toSrt(sourceEntries.map(entry => ({ id: entry.id, timecode: entry.timecode, text: repairedMap?.get(String(entry.id)) || entry.text })));
+  return chunks;
 }
+
+function parseAndValidateSrt(source, translated) {
+  const original = parseSrt(source);
+  const result = parseSrt(translated);
+  if (!original.length || original.length !== result.length) {
+    throw new Error(`Invalid translated SRT entry count: ${result.length}/${original.length}`);
+  }
+  for (let i = 0; i < original.length; i += 1) {
+    if (original[i].id !== result[i].id || original[i].timecode !== result[i].timecode || !result[i].text) {
+      throw new Error(`Invalid SRT structure at cue ${i + 1}`);
+    }
+  }
+  return result;
+}
+
+function reconcileTranslatedSrt(source, candidate) {
+  const original = parseSrt(source);
+  const translated = parseSrt(candidate);
+  if (!original.length) throw new Error('Invalid source SRT');
+  const byId = new Map(translated.map(entry => [String(entry.id), entry]));
+  const repaired = original.map(entry => {
+    const found = byId.get(String(entry.id));
+    return { id: entry.id, timecode: entry.timecode, text: found?.text?.trim() || entry.text };
+  });
+  return toSrt(repaired);
+}
+
+function validateSlovenianSubtitle(text) {
+  const lines = String(text || '').split('\n');
+  return lines.length <= MAX_LINES && lines.every(line => line.length <= MAX_LINE_CHARS);
+}
+
+// ---------- Reading-speed (CPS) helpers ----------
+
+function timecodeToSeconds(hms) {
+  const m = String(hms || '').trim().match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
+  if (!m) return 0;
+  const [, hh, mm, ss, ms] = m;
+  return Number(hh) * 3600 + Number(mm) * 60 + Number(ss) + Number(ms) / 1000;
+}
+
+function cueDurationSeconds(entry) {
+  const [start, end] = String(entry.timecode || '').split(' --> ');
+  return Math.max(0.2, timecodeToSeconds(end) - timecodeToSeconds(start));
+}
+
+function maxCharsForDuration(durationSeconds, targetCps = TARGET_CPS) {
+  return Math.max(8, Math.min(MAX_LINES * MAX_LINE_CHARS, Math.round(durationSeconds * targetCps)));
+}
+
+// Returns entries whose translated text is meaningfully over the reading-speed budget.
+function findTooFastCues(entries) {
+  const overLimit = [];
+  for (const entry of entries) {
+    const duration = cueDurationSeconds(entry);
+    const budget = maxCharsForDuration(duration);
+    const length = entry.text.replace(/\n/g, ' ').length;
+    // 15% tolerance to avoid pointless repair round-trips for near-misses.
+    if (length > budget * 1.15) overLimit.push({ id: entry.id, text: entry.text, budget });
+  }
+  return overLimit;
+}
+
+// ---------- Metadata (TMDB) ----------
+
+async function tmdbMetadata(imdbId) {
+  if (!process.env.TMDB_API_KEY) return { title: imdbId, overview: 'Not provided', credits: [], originalLanguage: null };
+  const base = 'https://api.themoviedb.org/3';
+  const find = await axios.get(`${base}/find/${encodeURIComponent(imdbId)}`, {
+    params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', external_source: 'imdb_id' }
+  });
+  const item = find.data.movie_results?.[0] || find.data.tv_results?.[0];
+  if (!item) return { title: imdbId, overview: 'Not provided', credits: [], originalLanguage: null };
+  const type = find.data.movie_results?.length ? 'movie' : 'tv';
+  const details = await axios.get(`${base}/${type}/${item.id}`, {
+    params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', append_to_response: 'credits' }
+  });
+  return {
+    title: details.data.title || details.data.name || imdbId,
+    overview: details.data.overview || 'Not provided',
+    originalLanguage: details.data.original_language || null,
+    credits: (details.data.credits?.cast || []).slice(0, 20).map(c => ({
+      name: c.character ? `${c.character} (${c.name})` : c.name,
+      gender: c.gender // TMDB: 0=unknown, 1=female, 2=male, 3=non-binary
+    }))
+  };
+}
+
+function buildMetadataContext(meta = {}) {
+  const genderLabel = { 1: 'Female', 2: 'Male', 3: 'Non-binary' };
+  const characters = (meta.credits || [])
+    .map(c => `${c.name}: ${genderLabel[c.gender] || 'Unknown'}`)
+    .join('\n') || 'No character gender metadata available.';
+  return `Title: ${meta.title || 'Unknown'}\nPlot: ${meta.overview || 'Not provided'}\nTMDB Cast Genders:\n${characters}`;
+}
+
+// ---------- OpenSubtitles (EN / HR / IT, ordered by original-language priority) ----------
+
+function resolveSourceLanguages(meta, requested) {
+  const list = [];
+  const req = String(requested || '').toLowerCase();
+  if (SUPPORTED_SOURCE_LANGUAGES.includes(req)) list.push(req);
+  // Subtitles in the film's ORIGINAL language usually already carry correct grammatical
+  // gender (Croatian/Italian mark gender on verbs), which makes pass 1 (character analysis)
+  // more reliable, so we prefer it when nothing was explicitly requested.
+  if (meta?.originalLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(meta.originalLanguage) && !list.includes(meta.originalLanguage)) {
+    list.push(meta.originalLanguage);
+  }
+  for (const lang of SUPPORTED_SOURCE_LANGUAGES) if (!list.includes(lang)) list.push(lang);
+  return list;
+}
+
+async function fetchOpenSubtitleForLanguage(imdbId, language) {
+  const headers = {
+    'Api-Key': process.env.OPENSUBTITLES_API_KEY,
+    'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.5.0',
+    Accept: 'application/json'
+  };
+  const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
+    headers,
+    params: { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' }
+  });
+  const file = search.data.data?.[0]?.attributes?.files?.[0];
+  if (!file?.file_id) return null;
+  const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers });
+  if (!download.data.link) return null;
+  const srt = (await axios.get(download.data.link)).data;
+  return { srt, language };
+}
+
+async function fetchOpenSubtitle(imdbId, meta, requestedLanguage) {
+  if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
+  const languages = resolveSourceLanguages(meta, requestedLanguage);
+  for (const language of languages) {
+    try {
+      const found = await fetchOpenSubtitleForLanguage(imdbId, language);
+      if (found) return found;
+    } catch (error) {
+      console.warn(`[opensubtitles] ${imdbId} (${language}) failed: ${error.message}`);
+    }
+  }
+  throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
+}
+
+// ---------- Claude (Anthropic) provider ----------
+
+function buildClaudeRequest(system, userText, model = ANTHROPIC_MODEL, maxTokens = 8192) {
+  return {
+    url: 'https://api.anthropic.com/v1/messages',
+    body: {
+      model,
+      max_tokens: maxTokens,
+      temperature: 0.1,
+      system,
+      messages: [{ role: 'user', content: userText }]
+    }
+  };
+}
+
+async function translateWithClaude(system, userText, options = {}) {
+  const apiKey = options.apiKey || ANTHROPIC_API_KEY;
+  const model = options.model || ANTHROPIC_MODEL;
+  const maxTokens = options.maxTokens || 8192;
+  const fetchImpl = options.fetchImpl || fetch;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
+  const request = buildClaudeRequest(system, userText, model, maxTokens);
+  const response = await fetchImpl(request.url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify(request.body)
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Claude HTTP ${response.status}: ${detail.slice(0, 300)}`);
+  }
+  const data = await response.json();
+  return (data.content || [])
+    .map(block => block.text || '')
+    .join('')
+    .replace(/^```(?:json|srt|text)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+// ---------- Pass 1: character / gender ledger extraction ----------
+
+function characterAnalysisPrompt(tmdbContext) {
+  return `You are preparing a character-gender reference sheet ("ledger") for a professional English/Croatian/Italian to Slovenian subtitle translation.
+
+You will be given the full dialogue text of a film or episode (one line per subtitle cue, in original order) and TMDB cast metadata.
+
+TASK:
+1. Identify every named or clearly identifiable character who speaks or is spoken to.
+2. Determine each character's gender using: their name, how other characters address them, pronouns/verb agreement in the source dialogue (Croatian and Italian mark gender directly on past-tense verbs and adjectives), and the TMDB cast list below.
+3. If the source is English and no strong textual evidence exists, rely on the TMDB cast metadata as the primary signal.
+4. If a character's gender truly cannot be determined from any source, mark it "unknown" rather than guessing.
+5. Note any characters who are addressed with formal "vikanje" vs informal "tikanje" if this is evident from context (e.g. rank, age gap, formality of a scene).
+
+TMDB CAST METADATA:
+${tmdbContext}
+
+Return ONLY a JSON object, no markdown, no commentary, in this exact shape:
+{"characters":[{"name":"<name as it appears/is addressed in dialogue>","gender":"male|female|unknown","confidence":"high|medium|low","note":"<one short clause of supporting evidence>"}]}
+
+Limit to at most 25 characters, prioritizing anyone with more than a couple of lines.`;
+}
+
+function parseCharacterLedger(raw) {
+  try {
+    let cleaned = String(raw || '').trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start >= 0 && end > start) cleaned = cleaned.slice(start, end + 1);
+    const data = JSON.parse(cleaned);
+    if (!Array.isArray(data?.characters)) return [];
+    return data.characters
+      .filter(c => c && typeof c.name === 'string' && c.name.trim())
+      .map(c => ({
+        name: c.name.trim(),
+        gender: ['male', 'female', 'unknown'].includes(c.gender) ? c.gender : 'unknown',
+        confidence: c.confidence || 'low',
+        note: c.note || ''
+      }));
+  } catch (_) {
+    return [];
+  }
+}
+
+function ledgerToText(characters) {
+  if (!characters.length) return 'No characters could be reliably identified from the dialogue; rely on TMDB cast metadata above.';
+  return characters
+    .map(c => `${c.name}: ${c.gender}${c.note ? ` (${c.note})` : ''} [confidence: ${c.confidence}]`)
+    .join('\n');
+}
+
+async function analyzeCharacters(sourceSrt, meta) {
+  const entries = parseSrt(sourceSrt);
+  // Plain dialogue lines are enough for this pass and keep the request compact; timestamps
+  // and IDs add no value for gender inference.
+  const dialogue = entries.map(e => e.text.replace(/\n/g, ' ')).join('\n');
+  const tmdbContext = buildMetadataContext(meta);
+  try {
+    const raw = await translateWithClaude(characterAnalysisPrompt(tmdbContext), dialogue, { maxTokens: 3000 });
+    return parseCharacterLedger(raw);
+  } catch (error) {
+    console.warn(`[character-analysis] failed, falling back to TMDB only: ${error.message}`);
+    return [];
+  }
+}
+
+// ---------- Pass 2: translation ----------
+
+function systemPrompt(context) {
+  return `You are an elite, professional subtitle translator and localizer specializing in English/Croatian/Italian to natural Slovenian translation.
+
+CONTEXT:
+${context}
+
+CORE TRANSLATION & SUBTITLE RULES:
+
+1. READING SPEED & LENGTH CONTROL (CRITICAL):
+- Every cue includes its allowed on-screen duration. Keep translated text within roughly ${TARGET_CPS} characters per second of that duration so viewers have time to read it comfortably.
+- Hard limits regardless of duration: maximum ${MAX_LINE_CHARS} characters per line, maximum ${MAX_LINES} lines per cue.
+- Condense wordy or literal translations: drop filler words, merge redundant phrases, prefer short natural Slovenian equivalents over long literal ones. Never sacrifice meaning, but prefer the shorter of two equally natural options.
+
+2. GENDER & CONTEXT ACCURACY (ON/ONA) — CRITICAL:
+- Use the CHARACTER LEDGER above as the authoritative source for each named character's gender. Apply it consistently for every single cue that character appears in, from the first line to the last.
+- For characters not in the ledger, infer gender from dialogue context (who is addressed, who is being talked about) and keep it consistent once established.
+- Never infer gender from voice alone — you cannot hear the audio. Use names, forms of address, relationships and the ledger only.
+- Apply correct Slovenian first-person forms: female "rekla sem", "prišla sem", "bila sem", "vesela sem"; male "rekel sem", "prišel sem", "bil sem", "vesel sem".
+- Apply correct second-person forms depending on the addressee's gender: "si videla" / "si videl", "si pripravljena" / "si pripravljen".
+- Distinguish the speaker's own gender from the gender of whoever they are addressing or describing — these are often different.
+- If evidence is genuinely insufficient for a minor, unnamed character, prefer neutral phrasing that avoids committing to an unsupported gender rather than guessing.
+
+3. NATURAL LOCALIZED LANGUAGE:
+- Avoid robotic literal translation. Localize idioms, slang and banter into modern conversational Slovenian.
+- Keep tikanje/vikanje consistent per relationship, per the ledger's formality notes where available.
+
+4. PERFECT SRT SYNTAX & STRUCTURAL INTEGRITY:
+- Retain every cue id exactly. Do not skip, merge, split, re-index, reorder or omit cues.
+- Output ONLY the requested JSON. No markdown, no commentary, no explanations.`;
+}
+
+function buildTranslationUserText(sourceEntries) {
+  const lines = sourceEntries.map(entry => {
+    const duration = cueDurationSeconds(entry).toFixed(1);
+    const budget = maxCharsForDuration(cueDurationSeconds(entry));
+    return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${entry.text.replace(/\n/g, ' / ')}`;
+  });
+  return `Return ONLY a JSON array with exactly one object per source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Use "\\n" inside "text" only if you need a genuine second line. Never merge or omit entries.
+
+SOURCE CUES (duration and character budget shown for each; stay within budget where possible):
+${lines.join('\n')}`;
+}
+
 function parseTranslationJson(value) {
   try {
-    let cleaned = String(value || '').replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
-    const start = cleaned.indexOf('['); const end = cleaned.lastIndexOf(']');
+    let cleaned = String(value || '').trim();
+    const start = cleaned.indexOf('[');
+    const end = cleaned.lastIndexOf(']');
     if (start >= 0 && end > start) cleaned = cleaned.slice(start, end + 1);
-    const data = JSON.parse(cleaned); if (!Array.isArray(data)) return null;
+    const data = JSON.parse(cleaned);
+    if (!Array.isArray(data)) return null;
     const map = new Map();
-    for (const item of data) if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+    for (const item of data) {
+      if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+    }
     return map;
-  } catch (_) { return null; }
+  } catch (_) {
+    return null;
+  }
 }
-async function translateSubtitle(imdbId, sourceLanguage) { const key = `${imdbId}:${sourceLanguage}:slv:gemini:${GEMINI_MODEL}`; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return cached.srt; if (inflight.has(key)) return inflight.get(key); const job = (async () => { const [source, meta] = await Promise.all([fetchOpenSubtitle(imdbId, sourceLanguage), tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`)]); const context = buildMetadataContext(meta); const fullChunk = { index: 0, entries: parseSrt(source), srt: source }; console.log(`[translation] ${imdbId}: full subtitle in one request, cues=${fullChunk.entries.length}, model=${GEMINI_MODEL}`); const srt = await translateChunk(fullChunk, context); parseAndValidateSrt(source, srt); cache.set(key, { srt, expiresAt: Date.now() + CACHE_TTL_MS }); console.log(`[translation] ${imdbId}: completed ${parseSrt(srt).length} cues`); return srt; })(); inflight.set(key, job); try { return await job; } finally { inflight.delete(key); } }
-async function runWithConcurrency(items, concurrency, worker) { if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be at least 1'); const results = new Array(items.length); let next = 0; async function consume() { while (true) { const index = next++; if (index >= items.length) return; results[index] = await worker(items[index], index); } } await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, consume)); return results; }
-function buildPlaceholderSrt() { return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.'; }
-function buildErrorSrt(message) { const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180); return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`; }
-function createSubtitleFileWaiter({ cache: cacheStore, jobs: jobsStore, pollMs = 1000, timeoutMs = SUBTITLE_FILE_TIMEOUT_MS } = {}) { return async function waitForSubtitleFile(jobKey) { const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) { const entry = cacheStore.get(jobKey); if (entry?.srt && entry.expiresAt > Date.now()) return entry.srt; const job = jobsStore.get(jobKey); if (job?.status === 'failed') throw new Error(job.error || 'Translation failed'); await new Promise(resolve => setTimeout(resolve, pollMs)); } throw new Error('Translation timed out'); }; }
+
+async function translateChunk(chunk, context) {
+  const sourceEntries = chunk.entries || parseSrt(chunk.srt);
+  const system = systemPrompt(context);
+  const userText = buildTranslationUserText(sourceEntries);
+  const response = await translateWithClaude(system, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+  let translated = parseTranslationJson(response);
+
+  if (!translated || translated.size !== sourceEntries.length) {
+    console.warn(`[translation] chunk ${chunk.index + 1} incomplete (${translated?.size || 0}/${sourceEntries.length}); repairing`);
+    const repaired = await translateWithClaude(`${system}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.`, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+    translated = parseTranslationJson(repaired) || translated || new Map();
+  }
+
+  let resultEntries = sourceEntries.map(entry => ({
+    id: entry.id,
+    timecode: entry.timecode,
+    text: translated.get(String(entry.id)) || entry.text
+  }));
+
+  // Reading-speed repair pass: ask Claude to shorten only the cues that are over budget.
+  const tooFast = findTooFastCues(resultEntries);
+  if (tooFast.length) {
+    console.warn(`[translation] chunk ${chunk.index + 1}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
+    const shortenPrompt = `${system}\n\nSHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same JSON array format as before, one object per listed id.`;
+    const shortenUserText = tooFast.map(c => `[id=${c.id} max_chars=${c.budget}] ${c.text.replace(/\n/g, ' / ')}`).join('\n');
+    try {
+      const shortenedRaw = await translateWithClaude(shortenPrompt, shortenUserText, { maxTokens: Math.min(4096, tooFast.length * 150 + 300) });
+      const shortenedMap = parseTranslationJson(shortenedRaw);
+      if (shortenedMap) {
+        resultEntries = resultEntries.map(entry => shortenedMap.has(String(entry.id)) ? { ...entry, text: shortenedMap.get(String(entry.id)) } : entry);
+      }
+    } catch (error) {
+      console.warn(`[translation] shortening pass failed, keeping original lengths: ${error.message}`);
+    }
+  }
+
+  return toSrt(resultEntries);
+}
+
+// ---------- Orchestration ----------
+
+async function translateSubtitle(imdbId, sourceLanguage) {
+  const key = `${imdbId}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+  const cached = cache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.srt;
+  if (inflight.has(key)) return inflight.get(key);
+
+  const job = (async () => {
+    const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
+    const { srt: source, language: usedLanguage } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage);
+    console.log(`[translation] ${imdbId}: source language=${usedLanguage}`);
+
+    const characters = await analyzeCharacters(source, meta);
+    const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
+
+    const fullChunk = { index: 0, entries: parseSrt(source), srt: source };
+    console.log(`[translation] ${imdbId}: full subtitle in one request, cues=${fullChunk.entries.length}, model=${ANTHROPIC_MODEL}`);
+    const srt = await translateChunk(fullChunk, context);
+    const validated = reconcileTranslatedSrt(source, srt);
+    parseAndValidateSrt(source, validated);
+
+    cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    console.log(`[translation] ${imdbId}: completed ${parseSrt(validated).length} cues`);
+    return validated;
+  })();
+
+  inflight.set(key, job);
+  try {
+    return await job;
+  } finally {
+    inflight.delete(key);
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be at least 1');
+  const results = new Array(items.length);
+  let next = 0;
+  async function consume() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, consume));
+  return results;
+}
+
+function buildPlaceholderSrt() {
+  return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.';
+}
+
+function buildErrorSrt(message) {
+  const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180);
+  return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`;
+}
+
+function createSubtitleFileWaiter({ cache: cacheStore, jobs: jobsStore, pollMs = 1000, timeoutMs = SUBTITLE_FILE_TIMEOUT_MS } = {}) {
+  return async function waitForSubtitleFile(jobKey) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const entry = cacheStore.get(jobKey);
+      if (entry?.srt && entry.expiresAt > Date.now()) return entry.srt;
+      const job = jobsStore.get(jobKey);
+      if (job?.status === 'failed') throw new Error(job.error || 'Translation failed');
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    throw new Error('Translation timed out');
+  };
+}
+
 function manifest() { return addonManifest; }
-function createApp() { const app = express(); const baseUrl = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, ''); app.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Methods', 'GET,OPTIONS'); res.set('Access-Control-Allow-Headers', 'Content-Type'); if (req.method === 'OPTIONS') return res.sendStatus(204); console.log(`[request] ${req.method} ${req.originalUrl}`); return next(); }); app.use(express.json({ limit: '1mb' })); app.get('/manifest.json', (_req, res) => res.json(manifest())); app.get('/manifest', (_req, res) => res.json(manifest())); app.get('/health', (_req, res) => res.json({ status: 'healthy', cacheEntries: cache.size, processingJobs: jobs.size, completedJobs: completed.size, geminiConfigured: Boolean(GEMINI_API_KEY), geminiModel: GEMINI_MODEL, fastTranslation: FAST_TRANSLATION, chunkSize: CHUNK_SIZE, concurrency: TRANSLATION_CONCURRENCY, fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS, tmdbConfigured: Boolean(process.env.TMDB_API_KEY), openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY) })); app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables.</p>')); app.get('/subtitle-file/:token.srt', async (req, res) => { const file = subtitleFiles.get(req.params.token); if (!file) return res.sendStatus(404); if (file.status === 'ready') return res.type('application/x-subrip; charset=utf-8').send(file.srt); try { const srt = await createSubtitleFileWaiter({ cache, jobs })(file.jobKey); file.status = 'ready'; file.srt = srt; return res.type('application/x-subrip; charset=utf-8').send(srt); } catch (error) { console.error(`[translation-file] ${error.message}`); return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message)); } }); app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => { console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`); const type = req.params[0]; const imdbId = req.params[1].replace(/\.json$/i, ''); const sourceLanguage = String(req.query.sourceLanguage || 'en').toLowerCase(); const key = `${imdbId}:${sourceLanguage}:slv:gemini:${GEMINI_MODEL}`; const root = baseUrl || `${req.protocol}://${req.get('host')}`; const publish = (srt, label = 'Slovenian AI', status = 'ready') => { const token = crypto.randomUUID(); subtitleFiles.set(token, { status, jobKey: key, srt }); setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.(); return { id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label }; }; const cached = cache.get(key); if (cached && cached.expiresAt > Date.now()) return res.json({ subtitles: [publish(cached.srt)] }); if (!jobs.has(key)) { jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null }); Promise.resolve().then(() => translateSubtitle(imdbId, sourceLanguage)).then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); }).catch(error => { const job = jobs.get(key); if (job) { job.error = error.message; job.status = 'failed'; } console.error(`[translation] ${error.message}`); }); } return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)', 'waiting')] }); }); return app; }
+
+// ---------- HTTP app ----------
+
+function createApp() {
+  const app = express();
+  const baseUrl = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+
+  app.use((req, res, next) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    console.log(`[request] ${req.method} ${req.originalUrl}`);
+    return next();
+  });
+  app.use(express.json({ limit: '1mb' }));
+
+  app.get('/manifest.json', (_req, res) => res.json(manifest()));
+  app.get('/manifest', (_req, res) => res.json(manifest()));
+
+  app.get('/health', (_req, res) => res.json({
+    status: 'healthy',
+    cacheEntries: cache.size,
+    processingJobs: jobs.size,
+    completedJobs: completed.size,
+    anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
+    anthropicModel: ANTHROPIC_MODEL,
+    chunkSize: CHUNK_SIZE,
+    concurrency: TRANSLATION_CONCURRENCY,
+    fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS,
+    targetCps: TARGET_CPS,
+    tmdbConfigured: Boolean(process.env.TMDB_API_KEY),
+    openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY)
+  }));
+
+  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
+
+  app.get('/subtitle-file/:token.srt', async (req, res) => {
+    const file = subtitleFiles.get(req.params.token);
+    if (!file) return res.sendStatus(404);
+    if (file.status === 'ready') return res.type('application/x-subrip; charset=utf-8').send(file.srt);
+    try {
+      const srt = await createSubtitleFileWaiter({ cache, jobs })(file.jobKey);
+      file.status = 'ready';
+      file.srt = srt;
+      return res.type('application/x-subrip; charset=utf-8').send(srt);
+    } catch (error) {
+      console.error(`[translation-file] ${error.message}`);
+      return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message));
+    }
+  });
+
+  app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
+    console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
+    const type = req.params[0];
+    const imdbId = req.params[1].replace(/\.json$/i, '');
+    const sourceLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
+    const key = `${imdbId}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+    const root = baseUrl || `${req.protocol}://${req.get('host')}`;
+
+    const publish = (srt, label = 'Slovenian AI', status = 'ready') => {
+      const token = crypto.randomUUID();
+      subtitleFiles.set(token, { status, jobKey: key, srt });
+      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
+      return { id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return res.json({ subtitles: [publish(cached.srt)] });
+
+    if (!jobs.has(key)) {
+      jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
+      Promise.resolve()
+        .then(() => translateSubtitle(imdbId, sourceLanguage))
+        .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
+        .catch(error => {
+          const job = jobs.get(key);
+          if (job) { job.error = error.message; job.status = 'failed'; }
+          console.error(`[translation] ${error.message}`);
+        });
+    }
+    return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)', 'waiting')] });
+  });
+
+  return app;
+}
+
 if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
-module.exports = { chunkSrt, parseAndValidateSrt, reconcileTranslatedSrt, validateSlovenianSubtitle, buildMetadataContext, buildPrompt, systemPrompt, manifest, createApp, buildPlaceholderSrt, buildErrorSrt, createSubtitleFileWaiter, runWithConcurrency, CHUNK_SIZE, TRANSLATION_CONCURRENCY, SUBTITLE_FILE_TIMEOUT_MS, GEMINI_MODEL, providerConfig, buildGeminiRequest, translateWithGemini };
+
+module.exports = {
+  chunkSrt,
+  parseAndValidateSrt,
+  reconcileTranslatedSrt,
+  validateSlovenianSubtitle,
+  buildMetadataContext,
+  systemPrompt,
+  manifest,
+  createApp,
+  buildPlaceholderSrt,
+  buildErrorSrt,
+  createSubtitleFileWaiter,
+  runWithConcurrency,
+  CHUNK_SIZE,
+  TRANSLATION_CONCURRENCY,
+  SUBTITLE_FILE_TIMEOUT_MS,
+  ANTHROPIC_MODEL,
+  providerConfig,
+  buildClaudeRequest,
+  translateWithClaude,
+  characterAnalysisPrompt,
+  parseCharacterLedger,
+  ledgerToText,
+  analyzeCharacters,
+  resolveSourceLanguages,
+  timecodeToSeconds,
+  cueDurationSeconds,
+  maxCharsForDuration,
+  findTooFastCues,
+  TARGET_CPS,
+  MAX_LINE_CHARS
+};
