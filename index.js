@@ -1,6 +1,8 @@
 const express = require('express');
 const axios = require('axios');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { default: SrtParser } = require('srt-parser-2');
 const srtParser = new SrtParser();
 
@@ -9,6 +11,11 @@ const CHUNK_SIZE = Math.max(40, Math.min(50, Number(process.env.CHUNK_SIZE || 45
 const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.TRANSLATION_CONCURRENCY || 1)));
 const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FILE_TIMEOUT_MS || 300000));
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+// Where finished translations are persisted so a Render restart/redeploy doesn't force
+// re-translating a movie that was already done. Point CACHE_DIR at a Render Persistent Disk
+// mount for this to actually survive redeploys; otherwise it only survives simple restarts
+// within the same container's lifetime (still better than pure in-memory).
+const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim();
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
@@ -490,6 +497,7 @@ async function translateSubtitle(imdbId, sourceLanguage) {
     parseAndValidateSrt(source, validated);
 
     cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    saveCacheEntryToDisk(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
     partials.delete(key);
     console.log(`[translation] ${imdbId}: completed ${parseSrt(validated).length} cues`);
     return validated;
@@ -542,6 +550,44 @@ function partialToSrt(partial) {
     return { id, timecode: entry.timecode, text: entry.text };
   });
   return toSrt(entries);
+}
+
+// ---------- Disk-persisted cache (survives restarts, not necessarily redeploys) ----------
+
+function cacheFilePath(key) {
+  const safe = String(key).replace(/[^a-z0-9:_-]/gi, '_');
+  return path.join(CACHE_DIR, `${safe}.json`);
+}
+
+function loadCacheFromDisk() {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) return;
+    const files = fs.readdirSync(CACHE_DIR).filter(f => f.endsWith('.json'));
+    let loaded = 0;
+    for (const file of files) {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), 'utf8'));
+        if (data?.key && data?.srt && data.expiresAt > Date.now()) {
+          cache.set(data.key, { srt: data.srt, expiresAt: data.expiresAt });
+          loaded += 1;
+        }
+      } catch (_) {
+        // Corrupt/partial cache file, skip it.
+      }
+    }
+    if (loaded) console.log(`[cache] loaded ${loaded} previously translated subtitle(s) from disk`);
+  } catch (error) {
+    console.warn(`[cache] failed to load from disk: ${error.message}`);
+  }
+}
+
+function saveCacheEntryToDisk(key, entry) {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cacheFilePath(key), JSON.stringify({ key, srt: entry.srt, expiresAt: entry.expiresAt }), 'utf8');
+  } catch (error) {
+    console.warn(`[cache] failed to persist ${key} to disk: ${error.message}`);
+  }
 }
 
 function buildPlaceholderSrt() {
@@ -600,7 +646,8 @@ function createApp() {
     fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS,
     targetCps: TARGET_CPS,
     tmdbConfigured: Boolean(process.env.TMDB_API_KEY),
-    openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY)
+    openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY),
+    cacheDir: CACHE_DIR
   }));
 
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
@@ -670,7 +717,10 @@ function createApp() {
   return app;
 }
 
-if (require.main === module) createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
+if (require.main === module) {
+  loadCacheFromDisk();
+  createApp().listen(PORT, '0.0.0.0', () => console.log(`Slo AI addon listening on ${PORT}`));
+}
 
 module.exports = {
   chunkSrt,
@@ -708,5 +758,9 @@ module.exports = {
   partialToSrt,
   removeSdh,
   stripSdhFromLine,
-  DEFAULT_LANGUAGE_PRIORITY
+  DEFAULT_LANGUAGE_PRIORITY,
+  cacheFilePath,
+  loadCacheFromDisk,
+  saveCacheEntryToDisk,
+  CACHE_DIR
 };
