@@ -437,10 +437,31 @@ function buildTranslationUserText(sourceEntries) {
     const budget = maxCharsForDuration(cueDurationSeconds(entry));
     return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${entry.text.replace(/\n/g, ' / ')}`;
   });
-  return `Return ONLY a JSON array with exactly one object per source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Use "\\n" inside "text" only if you need a genuine second line. Never merge or omit entries.
+  return `Return ONLY a JSON array with exactly one object per source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Use "\\n" inside "text" only if you need a genuine second line. If the Slovenian text itself contains a quotation mark, you MUST escape it as \\" — never leave a bare, unescaped " inside a "text" value, since that breaks the JSON. Never merge or omit entries.
 
 SOURCE CUES (duration and character budget shown for each; stay within budget where possible):
 ${lines.join('\n')}`;
+}
+
+// Lenient fallback: pulls out individual {"id":...,"text":"..."} pairs via regex even when
+// the overall JSON array is malformed (most commonly because one translated line contains an
+// unescaped quotation mark). This means one bad line no longer sinks the whole 45-cue chunk.
+function extractTranslationPairsLoosely(text) {
+  const map = new Map();
+  const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let match;
+  while ((match = regex.exec(String(text || ''))) !== null) {
+    const id = match[1].trim();
+    let decoded;
+    try {
+      decoded = JSON.parse(`"${match[2]}"`);
+    } catch (_) {
+      decoded = match[2].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+    decoded = decoded.trim();
+    if (id && decoded) map.set(id, decoded);
+  }
+  return map;
 }
 
 function parseTranslationJson(value) {
@@ -450,15 +471,18 @@ function parseTranslationJson(value) {
     const end = cleaned.lastIndexOf(']');
     if (start >= 0 && end > start) cleaned = cleaned.slice(start, end + 1);
     const data = JSON.parse(cleaned);
-    if (!Array.isArray(data)) return null;
-    const map = new Map();
-    for (const item of data) {
-      if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+    if (Array.isArray(data)) {
+      const map = new Map();
+      for (const item of data) {
+        if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+      }
+      if (map.size) return map;
     }
-    return map;
   } catch (_) {
-    return null;
+    // Strict parse failed (often one unescaped quote) — fall through to the lenient extractor.
   }
+  const loose = extractTranslationPairsLoosely(value);
+  return loose.size ? loose : null;
 }
 
 async function translateChunk(chunk, context) {
@@ -691,13 +715,30 @@ function deletePartialFromDisk(key) {
   }
 }
 
+// Wraps a raw error message in a friendlier Slovenian explanation for the most common,
+// actionable failure causes (out of AI credits, rate limited, missing config, no subtitles).
+function friendlyErrorMessage(raw) {
+  const msg = String(raw || '');
+  if (/credit/i.test(msg)) return 'Zmanjkalo je AI kreditov (Anthropic). Dopolni kredit na console.anthropic.com in poskusi znova.';
+  if (/rate.?limit|429/i.test(msg)) return 'Trenutno preveč hkratnih zahtev do AI (rate limit). Poskusi znova čez nekaj minut.';
+  if (/ANTHROPIC_API_KEY/i.test(msg)) return 'Manjka ali je neveljaven Anthropic API ključ na strežniku.';
+  if (/No subtitle found/i.test(msg)) return 'Za ta film ni bilo mogoče najti izvirnih podnapisov (HR/IT/EN).';
+  return msg || 'Translation failed';
+}
+
+// A short, low-risk info cue shown at the very start of the file so it's visible without
+// digging through server logs. Uses id "0" so it never collides with the real cue numbering.
+function statusNoticeSrt(text) {
+  return `0\n00:00:00,000 --> 00:00:04,000\n[Slo AI prevod] ${text}`;
+}
+
 function buildPlaceholderSrt() {
-  return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.';
+  return statusNoticeSrt('Prevajanje se je začelo, prosim počakaj...');
 }
 
 function buildErrorSrt(message) {
-  const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180);
-  return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`;
+  const safe = friendlyErrorMessage(message).replace(/[\r\n]+/g, ' ').slice(0, 200);
+  return statusNoticeSrt(`Napaka: ${safe}`);
 }
 
 // ---------- Keep-alive (best effort) ----------
@@ -794,10 +835,20 @@ function createApp() {
 
     // 2) Translation in progress — serve whatever chunks are done so far so the player
     //    never has to wait for the whole file. Cues not yet translated stay in the
-    //    source language until a later request picks up the finished version.
+    //    source language until a later request picks up the finished version. A short
+    //    status cue at the very start reports progress without digging through logs.
     const partial = partials.get(file.jobKey);
     if (partial) {
-      return res.type('application/x-subrip; charset=utf-8').send(partialToSrt(partial));
+      const body = partialToSrt(partial);
+      const done = partial.doneChunkIndices.size;
+      let notice = null;
+      if (done === 0) {
+        notice = statusNoticeSrt('Prevajanje se je začelo, prvi del bo kmalu na voljo...');
+      } else if (done < partial.totalChunks) {
+        notice = statusNoticeSrt(`Prvi del je preveden (${done}/${partial.totalChunks}), preostanek se prevaja v ozadju.`);
+      }
+      const combined = notice ? `${notice}\n\n${body}` : body;
+      return res.type('application/x-subrip; charset=utf-8').send(combined);
     }
 
     // 3) Job failed before any chunk finished.
@@ -898,5 +949,9 @@ module.exports = {
   savePartialToDisk,
   loadPartialFromDisk,
   deletePartialFromDisk,
-  ensureKeepAlive
+  ensureKeepAlive,
+  parseTranslationJson,
+  extractTranslationPairsLoosely,
+  friendlyErrorMessage,
+  statusNoticeSrt
 };

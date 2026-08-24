@@ -4,8 +4,8 @@ const { buildPlaceholderSrt } = require('../index');
 
 test('placeholder is valid SRT and explains that Slovenian translation is processing', () => {
   const srt = buildPlaceholderSrt();
-  assert.match(srt, /^1\n00:00:00,000 --> 00:00:08,000\n/);
-  assert.match(srt, /Slovenian AI subtitles are generating/i);
+  assert.match(srt, /^0\n00:00:00,000 --> 00:00:04,000\n/);
+  assert.match(srt, /Prevajanje se je začelo/i);
 });
 
 module.exports = {};
