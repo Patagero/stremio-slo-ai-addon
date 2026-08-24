@@ -45,10 +45,10 @@ test('analyzeCharacters falls back gracefully when Claude is not configured', as
   assert.deepEqual(characters, []);
 });
 
-test('source language priority prefers explicit request, then original language, then remaining supported languages', () => {
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, 'hr'), ['hr', 'it', 'en']);
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, null), ['it', 'en', 'hr']);
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: null }, null), ['en', 'hr', 'it']);
+test('source language priority is fixed HR -> IT -> EN, with an explicit request taking priority', () => {
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, 'en'), ['en', 'hr', 'it']);
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, null), ['hr', 'it', 'en']);
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: null }, null), ['hr', 'it', 'en']);
 });
 
 test('cue duration is computed from the SRT timecode', () => {

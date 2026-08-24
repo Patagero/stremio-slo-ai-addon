@@ -105,6 +105,35 @@ function validateSlovenianSubtitle(text) {
   return lines.length <= MAX_LINES && lines.every(line => line.length <= MAX_LINE_CHARS);
 }
 
+// ---------- SDH cleanup ----------
+// Strips hearing-impaired-only markup that regular subtitles don't need: bracketed sound
+// descriptions ("[door creaks]"), music-note delimited lines, and ALL-CAPS speaker labels
+// ("JOHN:"). This runs on the source subtitle before translation so it doesn't waste
+// translation budget or get carried into the Slovenian output.
+const SDH_BRACKET_RE = /\[[^\]\n]*\]/g;
+const SDH_MUSIC_NOTE_RE = /♪[^♪\n]*♪?/g;
+const SDH_SPEAKER_LABEL_RE = /^[-\s]*[A-ZČŠŽ][A-ZČŠŽ0-9 .'-]{1,30}:\s*/;
+
+function stripSdhFromLine(line) {
+  return String(line || '')
+    .replace(SDH_BRACKET_RE, '')
+    .replace(SDH_MUSIC_NOTE_RE, '')
+    .replace(SDH_SPEAKER_LABEL_RE, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function removeSdh(srtText) {
+  const entries = parseSrt(srtText)
+    .map(entry => ({
+      ...entry,
+      text: entry.text.split('\n').map(stripSdhFromLine).filter(Boolean).join('\n')
+    }))
+    .filter(entry => entry.text.trim().length > 0)
+    .map((entry, index) => ({ ...entry, id: String(index + 1) }));
+  return toSrt(entries);
+}
+
 // ---------- Reading-speed (CPS) helpers ----------
 
 function timecodeToSeconds(hms) {
@@ -171,18 +200,16 @@ function buildMetadataContext(meta = {}) {
 
 // ---------- OpenSubtitles (EN / HR / IT, ordered by original-language priority) ----------
 
+// Fiksna prioriteta iskanja izvornih podnapisov: hrvaščina, nato italijanščina, šele nato
+// angleščina (angleščina je najpogosteje na voljo, a je zadnja izbira po uporabnikovi želji).
+const DEFAULT_LANGUAGE_PRIORITY = ['hr', 'it', 'en'];
+
 function resolveSourceLanguages(meta, requested) {
-  const list = [];
   const req = String(requested || '').toLowerCase();
-  if (SUPPORTED_SOURCE_LANGUAGES.includes(req)) list.push(req);
-  // Subtitles in the film's ORIGINAL language usually already carry correct grammatical
-  // gender (Croatian/Italian mark gender on verbs), which makes pass 1 (character analysis)
-  // more reliable, so we prefer it when nothing was explicitly requested.
-  if (meta?.originalLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(meta.originalLanguage) && !list.includes(meta.originalLanguage)) {
-    list.push(meta.originalLanguage);
+  if (SUPPORTED_SOURCE_LANGUAGES.includes(req)) {
+    return [req, ...DEFAULT_LANGUAGE_PRIORITY.filter(lang => lang !== req)];
   }
-  for (const lang of SUPPORTED_SOURCE_LANGUAGES) if (!list.includes(lang)) list.push(lang);
-  return list;
+  return [...DEFAULT_LANGUAGE_PRIORITY];
 }
 
 async function fetchOpenSubtitleForLanguage(imdbId, language) {
@@ -438,8 +465,9 @@ async function translateSubtitle(imdbId, sourceLanguage) {
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
-    const { srt: source, language: usedLanguage } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage);
-    console.log(`[translation] ${imdbId}: source language=${usedLanguage}`);
+    const { srt: rawSource, language: usedLanguage } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage);
+    const source = removeSdh(rawSource);
+    console.log(`[translation] ${imdbId}: source language=${usedLanguage}, cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
 
     const characters = await analyzeCharacters(source, meta);
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
@@ -677,5 +705,8 @@ module.exports = {
   MAX_LINE_CHARS,
   createPartialTracker,
   mergeChunkIntoPartial,
-  partialToSrt
+  partialToSrt,
+  removeSdh,
+  stripSdhFromLine,
+  DEFAULT_LANGUAGE_PRIORITY
 };
