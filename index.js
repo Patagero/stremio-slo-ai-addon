@@ -219,12 +219,50 @@ function resolveSourceLanguages(meta, requested) {
   return [...DEFAULT_LANGUAGE_PRIORITY];
 }
 
-async function fetchOpenSubtitleForLanguage(imdbId, language) {
+// Anonymous Api-Key access on OpenSubtitles has a very low daily quota. Logging in with a
+// real account (even a free one) gets a JWT token that unlocks a much higher daily quota,
+// so we log in once and reuse the token for every search/download call.
+let openSubtitlesToken = null; // { value, expiresAt }
+
+async function openSubtitlesLogin() {
+  const username = process.env.OPENSUBTITLES_USERNAME;
+  const password = process.env.OPENSUBTITLES_PASSWORD;
+  if (!username || !password) return null;
+  if (openSubtitlesToken && openSubtitlesToken.expiresAt > Date.now()) return openSubtitlesToken.value;
+  try {
+    const response = await axios.post('https://api.opensubtitles.com/api/v1/login', { username, password }, {
+      headers: {
+        'Api-Key': process.env.OPENSUBTITLES_API_KEY,
+        'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.5.0',
+        'Content-Type': 'application/json',
+        Accept: '*/*'
+      }
+    });
+    const token = response.data?.token;
+    if (!token) return null;
+    // OpenSubtitles JWTs are valid ~24h; refresh a bit early to stay safe.
+    openSubtitlesToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
+    console.log('[opensubtitles] logged in, using authenticated (higher-quota) access');
+    return token;
+  } catch (error) {
+    console.warn(`[opensubtitles] login failed, falling back to anonymous access: ${error.message}`);
+    return null;
+  }
+}
+
+async function openSubtitlesHeaders() {
+  const token = await openSubtitlesLogin();
   const headers = {
     'Api-Key': process.env.OPENSUBTITLES_API_KEY,
     'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.5.0',
-    Accept: 'application/json'
+    Accept: '*/*'
   };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+async function fetchOpenSubtitleForLanguage(imdbId, language) {
+  const headers = await openSubtitlesHeaders();
   const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
     headers,
     params: { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' }
@@ -647,6 +685,7 @@ function createApp() {
     targetCps: TARGET_CPS,
     tmdbConfigured: Boolean(process.env.TMDB_API_KEY),
     openSubtitlesConfigured: Boolean(process.env.OPENSUBTITLES_API_KEY),
+    openSubtitlesLoginConfigured: Boolean(process.env.OPENSUBTITLES_USERNAME && process.env.OPENSUBTITLES_PASSWORD),
     cacheDir: CACHE_DIR
   }));
 
@@ -762,5 +801,7 @@ module.exports = {
   cacheFilePath,
   loadCacheFromDisk,
   saveCacheEntryToDisk,
-  CACHE_DIR
+  CACHE_DIR,
+  openSubtitlesLogin,
+  openSubtitlesHeaders
 };
