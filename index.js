@@ -520,13 +520,26 @@ async function translateSubtitle(imdbId, sourceLanguage) {
     const chunks = chunkSrt(source, CHUNK_SIZE);
     console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${ANTHROPIC_MODEL}`);
 
-    const partial = createPartialTracker(parseSrt(source), chunks.length);
+    const sourceEntries = parseSrt(source);
+    const sourceIds = sourceEntries.map(e => e.id);
+    const savedPartial = loadPartialFromDisk(key);
+    const resumable = savedPartial
+      && savedPartial.totalChunks === chunks.length
+      && savedPartial.order.length === sourceIds.length
+      && savedPartial.order.every((id, i) => id === sourceIds[i]);
+
+    const partial = resumable ? savedPartial : createPartialTracker(sourceEntries, chunks.length);
+    if (resumable && partial.doneChunkIndices.size) {
+      console.log(`[translation] ${imdbId}: resuming from disk, ${partial.doneChunkIndices.size}/${chunks.length} chunk(s) already done`);
+    }
     partials.set(key, partial);
 
     await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async chunk => {
+      if (partial.doneChunkIndices.has(chunk.index)) return; // already done in an earlier, interrupted run
       const chunkSrtResult = await translateChunk(chunk, context);
-      mergeChunkIntoPartial(partial, chunkSrtResult);
-      console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunks}/${chunks.length} total)`);
+      mergeChunkIntoPartial(partial, chunkSrtResult, chunk.index);
+      savePartialToDisk(key, partial);
+      console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunkIndices.size}/${chunks.length} total)`);
       return chunkSrtResult;
     });
 
@@ -536,6 +549,7 @@ async function translateSubtitle(imdbId, sourceLanguage) {
 
     cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
     saveCacheEntryToDisk(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    deletePartialFromDisk(key);
     partials.delete(key);
     console.log(`[translation] ${imdbId}: completed ${parseSrt(validated).length} cues`);
     return validated;
@@ -571,14 +585,14 @@ function createPartialTracker(sourceEntries, totalChunks) {
     entryMap: new Map(sourceEntries.map(e => [e.id, { timecode: e.timecode, text: e.text }])),
     order: sourceEntries.map(e => e.id),
     totalChunks,
-    doneChunks: 0
+    doneChunkIndices: new Set()
   };
 }
 
-function mergeChunkIntoPartial(partial, chunkSrtText) {
+function mergeChunkIntoPartial(partial, chunkSrtText, chunkIndex) {
   const entries = parseSrt(chunkSrtText);
   for (const entry of entries) partial.entryMap.set(entry.id, { timecode: entry.timecode, text: entry.text });
-  partial.doneChunks += 1;
+  if (typeof chunkIndex === 'number') partial.doneChunkIndices.add(chunkIndex);
   return partial;
 }
 
@@ -628,6 +642,55 @@ function saveCacheEntryToDisk(key, entry) {
   }
 }
 
+// ---------- Resumable progress (survives a mid-translation restart/spin-down) ----------
+
+function partialFilePath(key) {
+  const safe = String(key).replace(/[^a-z0-9:_-]/gi, '_');
+  return path.join(CACHE_DIR, `partial-${safe}.json`);
+}
+
+function savePartialToDisk(key, partial) {
+  try {
+    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    const data = {
+      key,
+      order: partial.order,
+      totalChunks: partial.totalChunks,
+      doneChunkIndices: [...partial.doneChunkIndices],
+      entries: Object.fromEntries(partial.entryMap)
+    };
+    fs.writeFileSync(partialFilePath(key), JSON.stringify(data), 'utf8');
+  } catch (error) {
+    console.warn(`[cache] failed to persist translation progress for ${key}: ${error.message}`);
+  }
+}
+
+function loadPartialFromDisk(key) {
+  try {
+    const file = partialFilePath(key);
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!Array.isArray(data.order) || !data.entries) return null;
+    return {
+      entryMap: new Map(Object.entries(data.entries)),
+      order: data.order,
+      totalChunks: data.totalChunks,
+      doneChunkIndices: new Set(data.doneChunkIndices || [])
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function deletePartialFromDisk(key) {
+  try {
+    const file = partialFilePath(key);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  } catch (_) {
+    // best effort cleanup, not critical
+  }
+}
+
 function buildPlaceholderSrt() {
   return '1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI subtitles are generating... Please reload subtitles shortly.';
 }
@@ -635,6 +698,32 @@ function buildPlaceholderSrt() {
 function buildErrorSrt(message) {
   const safe = String(message || 'Translation failed').replace(/[\r\n]+/g, ' ').slice(0, 180);
   return `1\n00:00:00,000 --> 00:00:08,000\nSlovenian AI translation unavailable: ${safe}`;
+}
+
+// ---------- Keep-alive (best effort) ----------
+// Render's free tier can spin the service down after ~15 min without inbound HTTP traffic.
+// While a translation job is actively running, we self-ping our own /health endpoint every
+// few minutes so an in-progress translation isn't killed just because nobody is watching.
+let keepAliveTimer = null;
+
+function ensureKeepAlive() {
+  if (keepAliveTimer) return;
+  const baseUrl = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  if (!baseUrl) return; // no public URL configured, can't self-ping
+  keepAliveTimer = setInterval(async () => {
+    const stillActive = [...jobs.values()].some(j => j.status === 'processing');
+    if (!stillActive) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
+      return;
+    }
+    try {
+      await axios.get(`${baseUrl}/health`, { timeout: 10000 });
+    } catch (_) {
+      // best effort only, a failed ping is not fatal
+    }
+  }, 4 * 60 * 1000);
+  keepAliveTimer.unref?.();
 }
 
 function createSubtitleFileWaiter({ cache: cacheStore, jobs: jobsStore, pollMs = 1000, timeoutMs = SUBTITLE_FILE_TIMEOUT_MS } = {}) {
@@ -741,6 +830,7 @@ function createApp() {
 
     if (!jobs.has(key)) {
       jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
+      ensureKeepAlive();
       Promise.resolve()
         .then(() => translateSubtitle(imdbId, sourceLanguage))
         .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
@@ -803,5 +893,10 @@ module.exports = {
   saveCacheEntryToDisk,
   CACHE_DIR,
   openSubtitlesLogin,
-  openSubtitlesHeaders
+  openSubtitlesHeaders,
+  partialFilePath,
+  savePartialToDisk,
+  loadPartialFromDisk,
+  deletePartialFromDisk,
+  ensureKeepAlive
 };
