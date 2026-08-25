@@ -560,11 +560,27 @@ async function translateSubtitle(imdbId, sourceLanguage) {
 
     await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async chunk => {
       if (partial.doneChunkIndices.has(chunk.index)) return; // already done in an earlier, interrupted run
-      const chunkSrtResult = await translateChunk(chunk, context);
-      mergeChunkIntoPartial(partial, chunkSrtResult, chunk.index);
-      savePartialToDisk(key, partial);
-      console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunkIndices.size}/${chunks.length} total)`);
-      return chunkSrtResult;
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          const chunkSrtResult = await translateChunk(chunk, context);
+          mergeChunkIntoPartial(partial, chunkSrtResult, chunk.index);
+          savePartialToDisk(key, partial);
+          console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunkIndices.size}/${chunks.length} total)`);
+          return;
+        } catch (error) {
+          console.warn(`[translation] ${imdbId}: chunk ${chunk.index + 1} attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
+          if (attempt === maxAttempts) {
+            // Give up on this one chunk only — leave it in the source language rather than
+            // aborting the whole job and freezing every later chunk forever.
+            console.error(`[translation] ${imdbId}: chunk ${chunk.index + 1} permanently failed, leaving it in the source language`);
+            partial.doneChunkIndices.add(chunk.index);
+            savePartialToDisk(key, partial);
+            return;
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        }
+      }
     });
 
     const srt = partialToSrt(partial);
@@ -879,7 +895,7 @@ function createApp() {
     const cached = cache.get(key);
     if (cached && cached.expiresAt > Date.now()) return res.json({ subtitles: [publish(cached.srt)] });
 
-    if (!jobs.has(key)) {
+    if (!jobs.has(key) || jobs.get(key)?.status === 'failed') {
       jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
       ensureKeepAlive();
       Promise.resolve()
