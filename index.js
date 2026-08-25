@@ -63,12 +63,13 @@ function parseSrt(srt) {
 }
 
 function toSrt(entries) {
-  return srtParser.toSrt(entries.map(e => ({
-    id: e.id,
-    startTime: e.timecode.split(' --> ')[0],
-    endTime: e.timecode.split(' --> ')[1],
-    text: e.text
-  })));
+  // NOTE: srtParser.toSrt() from the 'srt-parser-2' library was found to occasionally
+  // reformat timestamps incorrectly during round-tripping (wrong separator/padding),
+  // producing corrupted SRT files. We write the timecode line verbatim instead, exactly
+  // as it was originally parsed, so it can never be mangled by a serialization step.
+  return entries
+    .map(e => `${e.id}\n${e.timecode}\n${e.text}`)
+    .join('\n\n') + '\n';
 }
 
 function chunkSrt(srt, chunkSize = CHUNK_SIZE) {
