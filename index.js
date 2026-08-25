@@ -259,31 +259,45 @@ function resolveSourceLanguages(meta, requested, strict) {
 // real account (even a free one) gets a JWT token that unlocks a much higher daily quota,
 // so we log in once and reuse the token for every search/download call.
 let openSubtitlesToken = null; // { value, expiresAt }
+let openSubtitlesLoginPromise = null; // in-flight login request, shared by concurrent callers
 
 async function openSubtitlesLogin() {
   const username = process.env.OPENSUBTITLES_USERNAME;
   const password = process.env.OPENSUBTITLES_PASSWORD;
   if (!username || !password) return null;
   if (openSubtitlesToken && openSubtitlesToken.expiresAt > Date.now()) return openSubtitlesToken.value;
-  try {
-    const response = await axios.post('https://api.opensubtitles.com/api/v1/login', { username, password }, {
-      headers: {
-        'Api-Key': process.env.OPENSUBTITLES_API_KEY,
-        'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.5.0',
-        'Content-Type': 'application/json',
-        Accept: '*/*'
-      }
-    });
-    const token = response.data?.token;
-    if (!token) return null;
-    // OpenSubtitles JWTs are valid ~24h; refresh a bit early to stay safe.
-    openSubtitlesToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
-    console.log('[opensubtitles] logged in, using authenticated (higher-quota) access');
-    return token;
-  } catch (error) {
-    console.warn(`[opensubtitles] login failed, falling back to anonymous access: ${error.message}`);
-    return null;
-  }
+
+  // The EN/HR/IT multi-track feature starts three translation jobs at once, each of which
+  // needs this token — without a single-flight guard, all three would fire simultaneous
+  // login requests the moment a new film is opened, which can itself trip OpenSubtitles'
+  // rate limit (this is what caused the 406/429 failures during testing).
+  if (openSubtitlesLoginPromise) return openSubtitlesLoginPromise;
+
+  openSubtitlesLoginPromise = (async () => {
+    try {
+      const response = await axios.post('https://api.opensubtitles.com/api/v1/login', { username, password }, {
+        headers: {
+          'Api-Key': process.env.OPENSUBTITLES_API_KEY,
+          'User-Agent': process.env.OPENSUBTITLES_USER_AGENT || 'SloAIAddon v0.5.0',
+          'Content-Type': 'application/json',
+          Accept: '*/*'
+        }
+      });
+      const token = response.data?.token;
+      if (!token) return null;
+      // OpenSubtitles JWTs are valid ~24h; refresh a bit early to stay safe.
+      openSubtitlesToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
+      console.log('[opensubtitles] logged in, using authenticated (higher-quota) access');
+      return token;
+    } catch (error) {
+      console.warn(`[opensubtitles] login failed, falling back to anonymous access: ${error.message}`);
+      return null;
+    } finally {
+      openSubtitlesLoginPromise = null; // clear so a later, non-concurrent call can retry
+    }
+  })();
+
+  return openSubtitlesLoginPromise;
 }
 
 async function openSubtitlesHeaders() {
@@ -297,7 +311,23 @@ async function openSubtitlesHeaders() {
   return headers;
 }
 
+// The EN/HR/IT multi-track feature starts three translation jobs at once, each of which
+// searches OpenSubtitles (hash search + fallback search, up to 2 requests each) — without
+// limiting this, opening a new film can burst up to 6 near-simultaneous requests and trip
+// OpenSubtitles' own rate limit, which is exactly what caused several failed lookups in
+// testing. This is a simple serial queue: every OpenSubtitles call waits its turn.
+let openSubtitlesQueue = Promise.resolve();
+function withOpenSubtitlesLimit(task) {
+  const run = openSubtitlesQueue.then(task, task);
+  openSubtitlesQueue = run.then(() => {}, () => {}); // one failure must not block the next caller
+  return run;
+}
+
 async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash) {
+  return withOpenSubtitlesLimit(() => fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash));
+}
+
+async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash) {
   const headers = await openSubtitlesHeaders();
   const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' };
 
@@ -1177,5 +1207,7 @@ module.exports = {
   buildCacheKey,
   parseExtraHash,
   cacheableSystemBlock,
-  withAddendum
+  withAddendum,
+  withOpenSubtitlesLimit,
+  fetchOpenSubtitleForLanguage
 };
