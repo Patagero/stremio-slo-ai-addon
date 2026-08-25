@@ -234,9 +234,12 @@ function buildMetadataContext(meta = {}) {
 
 // ---------- OpenSubtitles (EN / HR / IT, ordered by original-language priority) ----------
 
-// Fiksna prioriteta iskanja izvornih podnapisov: hrvaščina, nato italijanščina, šele nato
-// angleščina (angleščina je najpogosteje na voljo, a je zadnja izbira po uporabnikovi želji).
-const DEFAULT_LANGUAGE_PRIORITY = ['hr', 'it', 'en'];
+// Fiksna prioriteta iskanja izvornih podnapisov: angleščina, nato hrvaščina, nato
+// italijanščina. Angleščina je na prvem mestu, ker je na OpenSubtitles bistežno bolj
+// razpoložljiva kot HR/IT, kar poveča verjetnost pravega moviehash ujemanja (glej
+// moviehash_match popravek) — na račun manjše slovnične podpore pri prepoznavi spola,
+// ki jo HR/IT sicer dajeta z glagolskimi oblikami v izvirniku.
+const DEFAULT_LANGUAGE_PRIORITY = ['en', 'hr', 'it'];
 
 function resolveSourceLanguages(meta, requested) {
   const req = String(requested || '').toLowerCase();
