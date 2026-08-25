@@ -296,14 +296,24 @@ async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash) {
   // WEBDL, theatrical vs extended cut, different intro/logo lengths) are very often NOT in
   // sync with each other even though OpenSubtitles treats them as "the same movie" — the
   // moviehash uniquely fingerprints the specific file, guaranteeing correct timing.
+  //
+  // IMPORTANT: sending `moviehash` alone does NOT guarantee the API only returns hash-
+  // verified results — it can still fall back to its normal best-match ranking (e.g. most
+  // downloaded) even when nothing actually matches the hash. `moviehash_match: 'only'` is
+  // the parameter that actually forces exclusively hash-verified results; without it, our
+  // earlier "hash-matched" logging was a false positive; we additionally double-check the
+  // `moviehash_match` attribute on the returned result itself, rather than trusting the
+  // request parameters alone, in case the API's filtering behavior changes.
   if (videoHash) {
     try {
       const hashSearch = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
         headers,
-        params: { ...baseParams, moviehash: videoHash }
+        params: { ...baseParams, moviehash: videoHash, moviehash_match: 'only' }
       });
-      const hashFile = hashSearch.data.data?.[0]?.attributes?.files?.[0];
-      if (hashFile?.file_id) {
+      const hashResult = hashSearch.data.data?.[0];
+      const hashFile = hashResult?.attributes?.files?.[0];
+      const verifiedMatch = hashResult?.attributes?.moviehash_match !== false; // treat missing field as trust the 'only' filter
+      if (hashFile?.file_id && verifiedMatch) {
         const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: hashFile.file_id }, { headers });
         if (download.data.link) {
           const srt = (await axios.get(download.data.link)).data;
