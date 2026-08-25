@@ -962,6 +962,12 @@ function createApp() {
     const file = subtitleFiles.get(req.params.token);
     if (!file) return res.sendStatus(404);
 
+    // Static, non-job-backed content (e.g. the "pick a source below" placeholder) — served
+    // as-is, no cache/job lookup needed since nothing is translating it.
+    if (file.static) {
+      return res.type('application/x-subrip; charset=utf-8').send(file.srt);
+    }
+
     // 1) Fully translated and cached — best case.
     const finalEntry = cache.get(file.jobKey);
     if (finalEntry && finalEntry.expiresAt > Date.now()) {
@@ -1031,6 +1037,18 @@ function createApp() {
       return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
     };
 
+    // A static, harmless first entry. Stremio auto-selects the FIRST subtitle for whichever
+    // language the person clicks — with three real EN/HR/IT translations, that meant it was
+    // silently starting playback with English every time, before the person got a chance to
+    // choose. Putting this instructional placeholder first means Stremio "auto-selects"
+    // this instead, prompting an explicit pick rather than a silent default.
+    const publishStatic = (srt, id, label) => {
+      const token = crypto.randomUUID();
+      subtitleFiles.set(token, { status: 'ready', static: true, srt });
+      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
+      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+
     // If a specific source language was requested via ?sourceLanguage=, keep the previous
     // single-result behavior (used by the health-check style manual testing flow).
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
@@ -1048,17 +1066,24 @@ function createApp() {
     // Default: offer one Slovenian track PER source language (EN/HR/IT) side by side in
     // Stremio's subtitle picker, so if one turns out mistimed (e.g. no exact hash match for
     // that language), the person can just pick a different source without waiting on us.
-    const subtitles = SUPPORTED_SOURCE_LANGUAGES.map(lang => {
-      const key = buildCacheKey(imdbId, lang, videoHash);
-      const id = `slo-ai-${type}-${imdbId}-${lang}`;
-      const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
-      const cached = cache.get(key);
-      if (cached && cached.expiresAt > Date.now()) {
-        return publish(key, cached.srt, id, label);
-      }
-      startJob(key, lang);
-      return publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting');
-    });
+    // Stays visible for the whole runtime (not just 4s) so it's impossible to miss if left
+    // selected by accident — nudging the person toward the real EN/HR/IT variants below.
+    const choosePlaceholder = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi EN, HR ali IT spodaj v seznamu variant.';
+
+    const subtitles = [
+      publishStatic(choosePlaceholder, `slo-ai-${type}-${imdbId}-choose`, '— Izberi vir spodaj (EN/HR/IT) —'),
+      ...SUPPORTED_SOURCE_LANGUAGES.map(lang => {
+        const key = buildCacheKey(imdbId, lang, videoHash);
+        const id = `slo-ai-${type}-${imdbId}-${lang}`;
+        const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
+        const cached = cache.get(key);
+        if (cached && cached.expiresAt > Date.now()) {
+          return publish(key, cached.srt, id, label);
+        }
+        startJob(key, lang);
+        return publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting');
+      })
+    ];
 
     return res.json({ subtitles });
   });
