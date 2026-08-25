@@ -241,8 +241,14 @@ function buildMetadataContext(meta = {}) {
 // ki jo HR/IT sicer dajeta z glagolskimi oblikami v izvirniku.
 const DEFAULT_LANGUAGE_PRIORITY = ['en', 'hr', 'it'];
 
-function resolveSourceLanguages(meta, requested) {
+function resolveSourceLanguages(meta, requested, strict) {
   const req = String(requested || '').toLowerCase();
+  if (strict && SUPPORTED_SOURCE_LANGUAGES.includes(req)) {
+    // The person explicitly picked this exact source from Stremio's subtitle menu — if it
+    // has no subtitle available, we should say so, not silently substitute another language
+    // they didn't choose (that would defeat the whole point of offering separate options).
+    return [req];
+  }
   if (SUPPORTED_SOURCE_LANGUAGES.includes(req)) {
     return [req, ...DEFAULT_LANGUAGE_PRIORITY.filter(lang => lang !== req)];
   }
@@ -339,9 +345,9 @@ async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash) {
   return { srt, language, matchedByHash: false };
 }
 
-async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash) {
+async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
-  const languages = resolveSourceLanguages(meta, requestedLanguage);
+  const languages = resolveSourceLanguages(meta, requestedLanguage, strict);
   for (const language of languages) {
     try {
       const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash);
@@ -617,7 +623,7 @@ function parseExtraHash(extra) {
   };
 }
 
-async function translateSubtitle(imdbId, sourceLanguage, videoHash) {
+async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict) {
   const key = buildCacheKey(imdbId, sourceLanguage, videoHash);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.srt;
@@ -625,7 +631,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash) {
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
-    const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash);
+    const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict);
     const source = removeSdh(rawSource);
     console.log(`[translation] ${imdbId}: source language=${usedLanguage}, hash-matched=${Boolean(matchedByHash)}, cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
 
@@ -996,37 +1002,65 @@ function createApp() {
     console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
     const type = req.params[0];
     const imdbId = req.params[1].replace(/\.json$/i, '');
-    const sourceLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
+    const explicitLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
     // Stremio passes the OpenSubtitles-compatible file hash for the exact video the person
     // is playing — using it lets us fetch a subtitle that is actually in sync with THIS
     // release, instead of a generic one that may have different intro/cut timing.
     const videoHash = parseExtraHash(req.params[2]).videoHash;
-    const key = buildCacheKey(imdbId, sourceLanguage, videoHash);
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
+    const sourceLangLabel = { en: 'EN', hr: 'HR', it: 'IT' };
 
-    const publish = (srt, label = 'Slovenian AI', status = 'ready') => {
-      const token = crypto.randomUUID();
-      subtitleFiles.set(token, { status, jobKey: key, srt });
-      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      return { id: `slo-ai-${type}-${imdbId}`, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
-    };
-
-    const cached = cache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return res.json({ subtitles: [publish(cached.srt)] });
-
-    if (!jobs.has(key) || jobs.get(key)?.status === 'failed') {
+    const startJob = (key, sourceLanguage) => {
+      if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
       jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
       ensureKeepAlive();
       Promise.resolve()
-        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash))
+        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, true))
         .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
         .catch(error => {
           const job = jobs.get(key);
           if (job) { job.error = error.message; job.status = 'failed'; }
           console.error(`[translation] ${error.message}`);
         });
+    };
+
+    const publish = (key, srt, id, label, status = 'ready') => {
+      const token = crypto.randomUUID();
+      subtitleFiles.set(token, { status, jobKey: key, srt });
+      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
+      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+
+    // If a specific source language was requested via ?sourceLanguage=, keep the previous
+    // single-result behavior (used by the health-check style manual testing flow).
+    if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
+      const key = buildCacheKey(imdbId, explicitLanguage, videoHash);
+      const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
+      const label = `Slovenian AI · ${sourceLangLabel[explicitLanguage]}`;
+      const cached = cache.get(key);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json({ subtitles: [publish(key, cached.srt, id, label)] });
+      }
+      startJob(key, explicitLanguage);
+      return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting')] });
     }
-    return res.json({ subtitles: [publish(buildPlaceholderSrt(), 'Slovenian AI (processing — reload shortly)', 'waiting')] });
+
+    // Default: offer one Slovenian track PER source language (EN/HR/IT) side by side in
+    // Stremio's subtitle picker, so if one turns out mistimed (e.g. no exact hash match for
+    // that language), the person can just pick a different source without waiting on us.
+    const subtitles = SUPPORTED_SOURCE_LANGUAGES.map(lang => {
+      const key = buildCacheKey(imdbId, lang, videoHash);
+      const id = `slo-ai-${type}-${imdbId}-${lang}`;
+      const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
+      const cached = cache.get(key);
+      if (cached && cached.expiresAt > Date.now()) {
+        return publish(key, cached.srt, id, label);
+      }
+      startJob(key, lang);
+      return publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting');
+    });
+
+    return res.json({ subtitles });
   });
 
   return app;
