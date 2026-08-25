@@ -288,26 +288,50 @@ async function openSubtitlesHeaders() {
   return headers;
 }
 
-async function fetchOpenSubtitleForLanguage(imdbId, language) {
+async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash) {
   const headers = await openSubtitlesHeaders();
-  const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
-    headers,
-    params: { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' }
-  });
+  const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' };
+
+  // Prefer an EXACT hash match first. Different releases of the same movie (BluRay vs
+  // WEBDL, theatrical vs extended cut, different intro/logo lengths) are very often NOT in
+  // sync with each other even though OpenSubtitles treats them as "the same movie" — the
+  // moviehash uniquely fingerprints the specific file, guaranteeing correct timing.
+  if (videoHash) {
+    try {
+      const hashSearch = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
+        headers,
+        params: { ...baseParams, moviehash: videoHash }
+      });
+      const hashFile = hashSearch.data.data?.[0]?.attributes?.files?.[0];
+      if (hashFile?.file_id) {
+        const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: hashFile.file_id }, { headers });
+        if (download.data.link) {
+          const srt = (await axios.get(download.data.link)).data;
+          return { srt, language, matchedByHash: true };
+        }
+      }
+    } catch (error) {
+      console.warn(`[opensubtitles] hash search failed for ${imdbId} (${language}): ${error.message}`);
+    }
+  }
+
+  // Fall back to a generic, most-downloaded subtitle for the movie. Better than nothing,
+  // but sync with this exact file is not guaranteed.
+  const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', { headers, params: baseParams });
   const file = search.data.data?.[0]?.attributes?.files?.[0];
   if (!file?.file_id) return null;
   const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers });
   if (!download.data.link) return null;
   const srt = (await axios.get(download.data.link)).data;
-  return { srt, language };
+  return { srt, language, matchedByHash: false };
 }
 
-async function fetchOpenSubtitle(imdbId, meta, requestedLanguage) {
+async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
   const languages = resolveSourceLanguages(meta, requestedLanguage);
   for (const language of languages) {
     try {
-      const found = await fetchOpenSubtitleForLanguage(imdbId, language);
+      const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash);
       if (found) return found;
     } catch (error) {
       console.warn(`[opensubtitles] ${imdbId} (${language}) failed: ${error.message}`);
@@ -557,17 +581,40 @@ async function translateChunk(chunk, context) {
 
 // ---------- Orchestration ----------
 
-async function translateSubtitle(imdbId, sourceLanguage) {
-  const key = `${imdbId}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+// Different releases of the same movie can have different timing (different intro length,
+// theatrical vs extended cut, etc.), so once we're matching subtitles by exact video hash,
+// the cache/job key needs to include that hash too — otherwise two different releases of
+// the same film would incorrectly share one cached translation timed for only one of them.
+function buildCacheKey(imdbId, sourceLanguage, videoHash) {
+  const idPart = videoHash ? `${imdbId}:${videoHash}` : imdbId;
+  return `${idPart}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+}
+
+// Stremio sends extra request parameters (filename, videoSize, videoHash) as a single
+// encoded path segment. We only need videoHash/videoSize; a small targeted regex is more
+// robust here than a generic query-string parser, since filenames can contain characters
+// (+, brackets, spaces) that confuse strict URLSearchParams parsing.
+function parseExtraHash(extra) {
+  const str = String(extra || '');
+  const hashMatch = str.match(/(?:^|&)videoHash=([a-f0-9]+)/i);
+  const sizeMatch = str.match(/(?:^|&)videoSize=(\d+)/i);
+  return {
+    videoHash: hashMatch ? hashMatch[1].toLowerCase() : null,
+    videoSize: sizeMatch ? sizeMatch[1] : null
+  };
+}
+
+async function translateSubtitle(imdbId, sourceLanguage, videoHash) {
+  const key = buildCacheKey(imdbId, sourceLanguage, videoHash);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.srt;
   if (inflight.has(key)) return inflight.get(key);
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
-    const { srt: rawSource, language: usedLanguage } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage);
+    const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash);
     const source = removeSdh(rawSource);
-    console.log(`[translation] ${imdbId}: source language=${usedLanguage}, cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
+    console.log(`[translation] ${imdbId}: source language=${usedLanguage}, hash-matched=${Boolean(matchedByHash)}, cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
 
     const characters = await analyzeCharacters(source, meta);
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
@@ -937,7 +984,11 @@ function createApp() {
     const type = req.params[0];
     const imdbId = req.params[1].replace(/\.json$/i, '');
     const sourceLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
-    const key = `${imdbId}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+    // Stremio passes the OpenSubtitles-compatible file hash for the exact video the person
+    // is playing — using it lets us fetch a subtitle that is actually in sync with THIS
+    // release, instead of a generic one that may have different intro/cut timing.
+    const videoHash = parseExtraHash(req.params[2]).videoHash;
+    const key = buildCacheKey(imdbId, sourceLanguage, videoHash);
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
 
     const publish = (srt, label = 'Slovenian AI', status = 'ready') => {
@@ -954,7 +1005,7 @@ function createApp() {
       jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
       ensureKeepAlive();
       Promise.resolve()
-        .then(() => translateSubtitle(imdbId, sourceLanguage))
+        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash))
         .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
         .catch(error => {
           const job = jobs.get(key);
@@ -1025,5 +1076,7 @@ module.exports = {
   parseTranslationJson,
   extractTranslationPairsLoosely,
   friendlyErrorMessage,
-  statusNoticeSrt
+  statusNoticeSrt,
+  buildCacheKey,
+  parseExtraHash
 };
