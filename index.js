@@ -362,15 +362,36 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
 // ---------- Claude (Anthropic) provider ----------
 
 function buildClaudeRequest(system, userText, model = ANTHROPIC_MODEL, maxTokens = 8192) {
+  // `system` can be a plain string (no caching) or an array of content blocks, where a
+  // block can carry `cache_control: {type: 'ephemeral'}` to mark it as a prompt-caching
+  // breakpoint. Anthropic caches everything up to and including that block, so repeated
+  // calls that share the same prefix (e.g. the same film's translation context reused
+  // across ~20-25 chunk requests) get billed at ~10% of normal input price for that part.
+  const systemPayload = Array.isArray(system) ? system : system;
   return {
     url: 'https://api.anthropic.com/v1/messages',
     body: {
       model,
       max_tokens: maxTokens,
-      system,
+      system: systemPayload,
       messages: [{ role: 'user', content: userText }]
     }
   };
+}
+
+// Wraps a system prompt string as a single cacheable content block.
+function cacheableSystemBlock(text) {
+  return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+}
+
+// Reuses the SAME cached base block (so the cache hit still applies) and appends a small,
+// call-specific addendum (e.g. a repair or shortening instruction) as a second, uncached
+// block — avoids re-paying full price for the large shared context just to add one note.
+function withAddendum(baseText, addendum) {
+  return [
+    { type: 'text', text: baseText, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: addendum }
+  ];
 }
 
 async function translateWithClaude(system, userText, options = {}) {
@@ -557,14 +578,18 @@ function parseTranslationJson(value) {
 
 async function translateChunk(chunk, context) {
   const sourceEntries = chunk.entries || parseSrt(chunk.srt);
-  const system = systemPrompt(context);
+  const systemText = systemPrompt(context);
   const userText = buildTranslationUserText(sourceEntries);
-  const response = await translateWithClaude(system, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+  // systemText is IDENTICAL for every chunk of the same film (same context/ledger), so
+  // marking it cacheable means only the first of ~20-25 calls per film pays full price for
+  // it — every later call (including repair/shortening passes below) reuses the cache.
+  const response = await translateWithClaude(cacheableSystemBlock(systemText), userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
   let translated = parseTranslationJson(response);
 
   if (!translated || translated.size !== sourceEntries.length) {
     console.warn(`[translation] chunk ${chunk.index + 1} incomplete (${translated?.size || 0}/${sourceEntries.length}); repairing`);
-    const repaired = await translateWithClaude(`${system}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.`, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+    const repairSystem = withAddendum(systemText, 'REPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.');
+    const repaired = await translateWithClaude(repairSystem, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
     translated = parseTranslationJson(repaired) || translated || new Map();
   }
 
@@ -578,10 +603,10 @@ async function translateChunk(chunk, context) {
   const tooFast = findTooFastCues(resultEntries);
   if (tooFast.length) {
     console.warn(`[translation] chunk ${chunk.index + 1}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
-    const shortenPrompt = `${system}\n\nSHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same JSON array format as before, one object per listed id.`;
+    const shortenSystem = withAddendum(systemText, 'SHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same JSON array format as before, one object per listed id.');
     const shortenUserText = tooFast.map(c => `[id=${c.id} max_chars=${c.budget}] ${c.text.replace(/\n/g, ' / ')}`).join('\n');
     try {
-      const shortenedRaw = await translateWithClaude(shortenPrompt, shortenUserText, { maxTokens: Math.min(4096, tooFast.length * 150 + 300) });
+      const shortenedRaw = await translateWithClaude(shortenSystem, shortenUserText, { maxTokens: Math.min(4096, tooFast.length * 150 + 300) });
       const shortenedMap = parseTranslationJson(shortenedRaw);
       if (shortenedMap) {
         resultEntries = resultEntries.map(entry => shortenedMap.has(String(entry.id)) ? { ...entry, text: shortenedMap.get(String(entry.id)) } : entry);
@@ -1150,5 +1175,7 @@ module.exports = {
   friendlyErrorMessage,
   statusNoticeSrt,
   buildCacheKey,
-  parseExtraHash
+  parseExtraHash,
+  cacheableSystemBlock,
+  withAddendum
 };
