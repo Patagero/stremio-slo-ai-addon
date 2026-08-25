@@ -3,8 +3,6 @@ const axios = require('axios');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { default: SrtParser } = require('srt-parser-2');
-const srtParser = new SrtParser();
 
 const PORT = Number(process.env.PORT || 7002);
 const CHUNK_SIZE = Math.max(40, Math.min(50, Number(process.env.CHUNK_SIZE || 45)));
@@ -54,19 +52,47 @@ const addonManifest = {
 
 // ---------- SRT parsing / building helpers ----------
 
+// A hand-written, dependency-free SRT reader/writer. We previously relied on the
+// 'srt-parser-2' npm package for both reading and writing, and even after fixing the write
+// side to emit timecodes verbatim, timestamps were STILL getting corrupted — meaning the
+// library's own *reading* logic was also mangling them, right from the very first parse of
+// a freshly downloaded subtitle. Owning both sides ourselves removes that risk entirely.
 function parseSrt(srt) {
-  return srtParser.fromSrt(String(srt || '').replace(/\r/g, '')).map((entry, index) => ({
-    id: String(entry.id ?? index + 1),
-    timecode: `${entry.startTime} --> ${entry.endTime}`,
-    text: String(entry.text || '').trim()
-  }));
+  const text = String(srt || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const blocks = text.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  const timingRe = /(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/;
+  const entries = [];
+
+  for (const block of blocks) {
+    const lines = block.split('\n');
+    if (!lines.length) continue;
+
+    let lineIndex = 0;
+    let id = lines[0].trim();
+    if (/^\d+$/.test(id)) {
+      lineIndex = 1; // standard case: first line is the numeric cue index
+    } else {
+      id = String(entries.length + 1); // tolerate files missing the index line
+    }
+
+    const timingMatch = (lines[lineIndex] || '').match(timingRe);
+    if (!timingMatch) continue; // not a valid cue block, skip it
+
+    const start = timingMatch[1].replace('.', ',');
+    const end = timingMatch[2].replace('.', ',');
+    const textLines = lines.slice(lineIndex + 1);
+
+    entries.push({
+      id,
+      timecode: `${start} --> ${end}`,
+      text: textLines.join('\n').trim()
+    });
+  }
+
+  return entries;
 }
 
 function toSrt(entries) {
-  // NOTE: srtParser.toSrt() from the 'srt-parser-2' library was found to occasionally
-  // reformat timestamps incorrectly during round-tripping (wrong separator/padding),
-  // producing corrupted SRT files. We write the timecode line verbatim instead, exactly
-  // as it was originally parsed, so it can never be mangled by a serialization step.
   return entries
     .map(e => `${e.id}\n${e.timecode}\n${e.text}`)
     .join('\n\n') + '\n';
