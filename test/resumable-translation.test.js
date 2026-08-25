@@ -16,7 +16,8 @@ test('in-progress translation state is saved to disk and can be loaded back with
     { id: '2', timecode: '00:00:02,500 --> 00:00:04,000', text: 'World.' }
   ];
   const partial = mod.createPartialTracker(sourceEntries, 2);
-  mod.mergeChunkIntoPartial(partial, '1\n00:00:00,000 --> 00:00:02,000\nŽivjo.\n', 0);
+  mod.mergeChunkIntoPartial(partial, [{ id: '1', timecode: '00:00:00,000 --> 00:00:02,000', text: 'Živjo.' }], 0);
+  mod.markChunkFailed(partial, 1);
   mod.savePartialToDisk(key, partial);
 
   assert.ok(fs.existsSync(mod.partialFilePath(key)));
@@ -24,8 +25,10 @@ test('in-progress translation state is saved to disk and can be loaded back with
   const reloaded = mod.loadPartialFromDisk(key);
   assert.ok(reloaded.doneChunkIndices.has(0));
   assert.equal(reloaded.doneChunkIndices.has(1), false);
+  // Chunk 1 failed (e.g. out of credits) — it must be marked for retry, not silently skipped.
+  assert.ok(reloaded.failedChunkIndices.has(1));
   assert.equal(reloaded.entryMap.get('1').text, 'Živjo.');
-  assert.equal(reloaded.entryMap.get('2').text, 'World.'); // chunk 1 never ran, still source language
+  assert.equal(reloaded.entryMap.get('2').text, 'World.'); // chunk 1 never succeeded, still source language
   assert.deepEqual(reloaded.order, ['1', '2']);
 
   mod.deletePartialFromDisk(key);

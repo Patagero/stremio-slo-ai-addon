@@ -522,7 +522,11 @@ async function translateChunk(chunk, context) {
     }
   }
 
-  return toSrt(resultEntries);
+  // Return structured entries directly — NOT a serialized string. Serializing here and
+  // re-parsing it back in the caller (mergeChunkIntoPartial) was an unnecessary round trip
+  // through the SRT library on both ends, which risked corrupting timestamps a second time
+  // even after toSrt() itself was fixed to write timecodes verbatim.
+  return resultEntries;
 }
 
 // ---------- Orchestration ----------
@@ -557,25 +561,29 @@ async function translateSubtitle(imdbId, sourceLanguage) {
     if (resumable && partial.doneChunkIndices.size) {
       console.log(`[translation] ${imdbId}: resuming from disk, ${partial.doneChunkIndices.size}/${chunks.length} chunk(s) already done`);
     }
+    if (resumable && partial.failedChunkIndices.size) {
+      console.log(`[translation] ${imdbId}: retrying ${partial.failedChunkIndices.size} previously failed chunk(s)`);
+    }
     partials.set(key, partial);
 
     await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async chunk => {
-      if (partial.doneChunkIndices.has(chunk.index)) return; // already done in an earlier, interrupted run
+      if (partial.doneChunkIndices.has(chunk.index)) return; // truly translated already, never redo
       const maxAttempts = 3;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
-          const chunkSrtResult = await translateChunk(chunk, context);
-          mergeChunkIntoPartial(partial, chunkSrtResult, chunk.index);
+          const resultEntries = await translateChunk(chunk, context);
+          mergeChunkIntoPartial(partial, resultEntries, chunk.index);
           savePartialToDisk(key, partial);
           console.log(`[translation] ${imdbId}: chunk ${chunk.index + 1}/${chunks.length} done (${partial.doneChunkIndices.size}/${chunks.length} total)`);
           return;
         } catch (error) {
           console.warn(`[translation] ${imdbId}: chunk ${chunk.index + 1} attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
           if (attempt === maxAttempts) {
-            // Give up on this one chunk only — leave it in the source language rather than
-            // aborting the whole job and freezing every later chunk forever.
-            console.error(`[translation] ${imdbId}: chunk ${chunk.index + 1} permanently failed, leaving it in the source language`);
-            partial.doneChunkIndices.add(chunk.index);
+            // Leave this chunk in the source language for now, but mark it as FAILED (not
+            // done) so it gets retried on the next visit instead of being skipped forever —
+            // this matters most for temporary causes like running out of AI credits.
+            console.error(`[translation] ${imdbId}: chunk ${chunk.index + 1} failed this run, will retry next time`);
+            markChunkFailed(partial, chunk.index);
             savePartialToDisk(key, partial);
             return;
           }
@@ -583,6 +591,13 @@ async function translateSubtitle(imdbId, sourceLanguage) {
         }
       }
     });
+
+    if (partial.failedChunkIndices.size > 0) {
+      // Don't finalize/cache an incomplete translation — leave it servable as a partial
+      // (whatever succeeded so far) and let the job be retried on the next visit.
+      partials.set(key, partial);
+      throw new Error(`${partial.failedChunkIndices.size}/${chunks.length} chunk(s) could not be translated this run (will retry next visit)`);
+    }
 
     const srt = partialToSrt(partial);
     const validated = reconcileTranslatedSrt(source, srt);
@@ -626,14 +641,25 @@ function createPartialTracker(sourceEntries, totalChunks) {
     entryMap: new Map(sourceEntries.map(e => [e.id, { timecode: e.timecode, text: e.text }])),
     order: sourceEntries.map(e => e.id),
     totalChunks,
-    doneChunkIndices: new Set()
+    doneChunkIndices: new Set(),
+    // Chunks that permanently failed this session (e.g. out of credits) — left in the
+    // source language for now, but MUST be retried on the next run, not skipped forever.
+    failedChunkIndices: new Set()
   };
 }
 
-function mergeChunkIntoPartial(partial, chunkSrtText, chunkIndex) {
-  const entries = parseSrt(chunkSrtText);
+// entries: array of {id, timecode, text} — already structured, no re-parsing needed.
+function mergeChunkIntoPartial(partial, entries, chunkIndex) {
   for (const entry of entries) partial.entryMap.set(entry.id, { timecode: entry.timecode, text: entry.text });
-  if (typeof chunkIndex === 'number') partial.doneChunkIndices.add(chunkIndex);
+  if (typeof chunkIndex === 'number') {
+    partial.doneChunkIndices.add(chunkIndex);
+    partial.failedChunkIndices.delete(chunkIndex);
+  }
+  return partial;
+}
+
+function markChunkFailed(partial, chunkIndex) {
+  partial.failedChunkIndices.add(chunkIndex);
   return partial;
 }
 
@@ -698,6 +724,7 @@ function savePartialToDisk(key, partial) {
       order: partial.order,
       totalChunks: partial.totalChunks,
       doneChunkIndices: [...partial.doneChunkIndices],
+      failedChunkIndices: [...(partial.failedChunkIndices || [])],
       entries: Object.fromEntries(partial.entryMap)
     };
     fs.writeFileSync(partialFilePath(key), JSON.stringify(data), 'utf8');
@@ -716,7 +743,8 @@ function loadPartialFromDisk(key) {
       entryMap: new Map(Object.entries(data.entries)),
       order: data.order,
       totalChunks: data.totalChunks,
-      doneChunkIndices: new Set(data.doneChunkIndices || [])
+      doneChunkIndices: new Set(data.doneChunkIndices || []),
+      failedChunkIndices: new Set(data.failedChunkIndices || [])
     };
   } catch (_) {
     return null;
@@ -952,6 +980,7 @@ module.exports = {
   MAX_LINE_CHARS,
   createPartialTracker,
   mergeChunkIntoPartial,
+  markChunkFailed,
   partialToSrt,
   removeSdh,
   stripSdhFromLine,
