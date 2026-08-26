@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -34,7 +33,6 @@ const cache = new Map();
 const inflight = new Map();
 const completed = new Map();
 const jobs = new Map();
-const subtitleFiles = new Map();
 // Progressive translation state: jobKey -> { entryMap, order, totalChunks, doneChunks }
 // Lets us serve "chunk 1 already done, rest still in the source language" instead of
 // making the player wait for the whole film to finish translating.
@@ -979,6 +977,10 @@ function statusNoticeSrt(text) {
   return `0\n00:00:00,000 --> 00:00:04,000\n[Slo AI prevod] ${text}`;
 }
 
+// Stays visible for the whole runtime (not just 4s) so it's impossible to miss if left
+// selected by accident — nudging the person toward the real EN/HR/IT variants below.
+const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi EN, HR ali IT spodaj v seznamu variant.';
+
 function buildPlaceholderSrt() {
   return statusNoticeSrt('Prevajanje se je začelo, prosim počakaj...');
 }
@@ -1088,29 +1090,28 @@ function createApp() {
       });
   }
 
-  app.get('/subtitle-file/:token.srt', (req, res) => {
-    const file = subtitleFiles.get(req.params.token);
-    if (!file) return res.sendStatus(404);
+  // Subtitle URLs are self-describing (imdbId + language + optional videoHash query param)
+  // instead of a random token looked up in an in-memory registry. A registry entry doesn't
+  // survive a Render restart/redeploy/spin-down (all of which wipe in-memory state and even
+  // the "persisted" disk cache without a paid Persistent Disk) — a self-describing URL does,
+  // since every request can reconstruct the exact same cache/job key from the URL itself,
+  // with no dependency on anything that could have been wiped in between.
+  app.get('/subtitle-file/:imdbId/:lang.srt', (req, res) => {
+    const { imdbId } = req.params;
+    const lang = req.params.lang;
+    const videoHash = req.query.hash ? String(req.query.hash) : null;
 
-    // Static, non-job-backed content (e.g. the "pick a source below" placeholder) — served
-    // as-is, no cache/job lookup needed since nothing is translating it.
-    if (file.static) {
-      return res.type('application/x-subrip; charset=utf-8').send(file.srt);
+    if (lang === 'choose') {
+      return res.type('application/x-subrip; charset=utf-8').send(CHOOSE_PLACEHOLDER_SRT);
     }
+    if (!SUPPORTED_SOURCE_LANGUAGES.includes(lang)) return res.sendStatus(404);
 
-    // Lazy start: this token was listed as a selectable option but no translation was
-    // started for it yet. The very first time someone actually opens THIS specific
-    // language's subtitle, kick off its job now — this is what makes "show three options"
-    // cost the same as "translate one", instead of always translating all three up front.
-    if (file.lazy && (!jobs.has(file.jobKey) || jobs.get(file.jobKey)?.status === 'failed')) {
-      startTranslationJob(file.lazy.imdbId, file.jobKey, file.lazy.sourceLanguage, file.lazy.videoHash, true);
-    }
+    const key = buildCacheKey(imdbId, lang, videoHash);
+    startTranslationJob(imdbId, key, lang, videoHash, true);
 
     // 1) Fully translated and cached — best case.
-    const finalEntry = cache.get(file.jobKey);
+    const finalEntry = cache.get(key);
     if (finalEntry && finalEntry.expiresAt > Date.now()) {
-      file.status = 'ready';
-      file.srt = finalEntry.srt;
       return res.type('application/x-subrip; charset=utf-8').send(finalEntry.srt);
     }
 
@@ -1118,7 +1119,7 @@ function createApp() {
     //    never has to wait for the whole file. Cues not yet translated stay in the
     //    source language until a later request picks up the finished version. A short
     //    status cue at the very start reports progress without digging through logs.
-    const partial = partials.get(file.jobKey);
+    const partial = partials.get(key);
     if (partial) {
       const body = partialToSrt(partial);
       const done = partial.doneChunkIndices.size;
@@ -1133,7 +1134,7 @@ function createApp() {
     }
 
     // 3) Job failed before any chunk finished.
-    const job = jobs.get(file.jobKey);
+    const job = jobs.get(key);
     if (job?.status === 'failed') {
       return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(job.error));
     }
@@ -1153,67 +1154,36 @@ function createApp() {
     const videoHash = parseExtraHash(req.params[2]).videoHash;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = { en: 'EN', hr: 'HR', it: 'IT' };
+    const hashQuery = videoHash ? `?hash=${encodeURIComponent(videoHash)}` : '';
 
-    const publish = (key, srt, id, label, status = 'ready') => {
-      const token = crypto.randomUUID();
-      subtitleFiles.set(token, { status, jobKey: key, srt });
-      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
-    };
-
-    // Publishes a token WITHOUT starting any translation job yet. The job only actually
-    // starts the first time this specific token is fetched (see the /subtitle-file route),
-    // so listing multiple language options costs nothing until one is genuinely opened.
-    const publishLazy = (key, sourceLanguage, id, label) => {
-      const token = crypto.randomUUID();
-      subtitleFiles.set(token, { status: 'waiting', jobKey: key, srt: buildPlaceholderSrt(), lazy: { imdbId, sourceLanguage, videoHash } });
-      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
-    };
-
-    const publishStatic = (srt, id, label) => {
-      const token = crypto.randomUUID();
-      subtitleFiles.set(token, { status: 'ready', static: true, srt });
-      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
-    };
+    // Self-describing URL — no token registry, so this survives any restart/redeploy that
+    // wipes in-memory state, since the URL itself contains everything /subtitle-file needs.
+    const buildUrl = lang => `${root}/subtitle-file/${encodeURIComponent(imdbId)}/${lang}.srt${hashQuery}`;
 
     // Manual override for testing/debugging a specific source via ?sourceLanguage=en|hr|it —
-    // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch. This one
-    // starts eagerly since it's an explicit, deliberate request.
+    // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch.
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
-      const key = buildCacheKey(imdbId, explicitLanguage, videoHash);
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
       const label = `Slovenian AI · ${sourceLangLabel[explicitLanguage]}`;
-      const cached = cache.get(key);
-      if (cached && cached.expiresAt > Date.now()) {
-        return res.json({ subtitles: [publish(key, cached.srt, id, label)] });
-      }
-      startTranslationJob(imdbId, key, explicitLanguage, videoHash, true);
-      return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting')] });
+      return res.json({ subtitles: [{ id, url: buildUrl(explicitLanguage), lang: 'slv', label }] });
     }
 
     // Default: offer EN/HR/IT as separate, explicitly-picked options — none of them starts
-    // translating until the person actually opens that specific one, so this costs exactly
-    // the same as translating one language, not three, no matter how many are listed.
+    // translating until the person actually opens that specific one (handled in
+    // /subtitle-file), so this costs exactly the same as translating one language, not
+    // three, no matter how many are listed.
     // Stremio auto-selects the FIRST subtitle for whichever language is clicked, so this
     // harmless placeholder goes first — it prompts an explicit pick instead of silently and
     // automatically starting (and billing) a real translation the moment "Slovenian" is
     // clicked, before the person has actually chosen a source.
-    const choosePlaceholder = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi EN, HR ali IT spodaj v seznamu variant.';
-
     const subtitles = [
-      publishStatic(choosePlaceholder, `slo-ai-${type}-${imdbId}-choose`, '— Izberi vir spodaj (EN/HR/IT) —'),
-      ...SUPPORTED_SOURCE_LANGUAGES.map(lang => {
-        const key = buildCacheKey(imdbId, lang, videoHash);
-        const id = `slo-ai-${type}-${imdbId}-${lang}`;
-        const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
-        const cached = cache.get(key);
-        if (cached && cached.expiresAt > Date.now()) {
-          return publish(key, cached.srt, id, label);
-        }
-        return publishLazy(key, lang, id, label);
-      })
+      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir spodaj (EN/HR/IT) —' },
+      ...SUPPORTED_SOURCE_LANGUAGES.map(lang => ({
+        id: `slo-ai-${type}-${imdbId}-${lang}`,
+        url: buildUrl(lang),
+        lang: 'slv',
+        label: `Slovenian AI · ${sourceLangLabel[lang]}`
+      }))
     ];
 
     return res.json({ subtitles });
