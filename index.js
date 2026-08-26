@@ -16,7 +16,7 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim();
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
 // Pass 1 (character/gender ledger) sends the WHOLE film's dialogue as input but only needs
 // a small structured list back — a cheaper model here meaningfully cuts cost with low risk
 // to overall quality, since Pass 2 (the actual translation, which needs the most nuance)
