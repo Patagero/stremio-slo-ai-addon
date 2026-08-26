@@ -650,6 +650,15 @@ async function translateChunk(chunk, context) {
     const repairInput = combineForGemini(systemText, `${userText}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.`);
     const repaired = await translateWithGemini(repairInput, { schema: fullSchema });
     translated = parseTranslationJson(repaired) || translated || new Map();
+
+    if (translated.size !== sourceEntries.length) {
+      // The repair attempt ALSO came back incomplete. Silently continuing here used to mean
+      // the chunk was marked "done" while some of its cues quietly stayed in the source
+      // language — throwing instead makes this a real failure, which the caller's existing
+      // 3-attempt retry loop (see translateSubtitle) will properly retry from scratch,
+      // rather than accepting a partially-untranslated chunk as if it succeeded.
+      throw new Error(`chunk ${chunk.index + 1} still incomplete after repair (${translated.size}/${sourceEntries.length})`);
+    }
   }
 
   let resultEntries = sourceEntries.map(entry => ({
