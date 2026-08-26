@@ -415,8 +415,14 @@ function buildClaudeRequest(system, userText, model = ANTHROPIC_MODEL, maxTokens
 }
 
 // Wraps a system prompt string as a single cacheable content block.
+// A full film's translation (~20-26 sequential chunks, each taking several seconds and
+// sometimes needing repair/shortening retries) easily exceeds Anthropic's DEFAULT 5-minute
+// cache lifetime — meaning the cache was likely expiring between chunks and getting
+// rewritten (at a 1.25x SURCHARGE over normal price) instead of ever being read (at 0.1x).
+// Requesting the 1-hour TTL explicitly means we pay the (slightly higher, 2x) write cost
+// ONCE per film, then get the cheap 0.1x read rate for every remaining chunk.
 function cacheableSystemBlock(text) {
-  return [{ type: 'text', text, cache_control: { type: 'ephemeral' } }];
+  return [{ type: 'text', text, cache_control: { type: 'ephemeral', ttl: '1h' } }];
 }
 
 // Reuses the SAME cached base block (so the cache hit still applies) and appends a small,
@@ -424,7 +430,7 @@ function cacheableSystemBlock(text) {
 // block — avoids re-paying full price for the large shared context just to add one note.
 function withAddendum(baseText, addendum) {
   return [
-    { type: 'text', text: baseText, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: baseText, cache_control: { type: 'ephemeral', ttl: '1h' } },
     { type: 'text', text: addendum }
   ];
 }
