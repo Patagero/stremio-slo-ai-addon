@@ -16,7 +16,12 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim();
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+// Pass 1 (character/gender ledger) sends the WHOLE film's dialogue as input but only needs
+// a small structured list back — a cheaper model here meaningfully cuts cost with low risk
+// to overall quality, since Pass 2 (the actual translation, which needs the most nuance)
+// keeps using ANTHROPIC_MODEL above.
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'claude-haiku-4-5-20251001';
 const providerConfig = { name: 'anthropic', model: ANTHROPIC_MODEL };
 
 // Ciljna hitrost branja (characters per second). 17 CPS je standardni okvir za odrasle gledalce
@@ -511,7 +516,7 @@ async function analyzeCharacters(sourceSrt, meta) {
   const dialogue = entries.map(e => e.text.replace(/\n/g, ' ')).join('\n');
   const tmdbContext = buildMetadataContext(meta);
   try {
-    const raw = await translateWithClaude(characterAnalysisPrompt(tmdbContext), dialogue, { maxTokens: 3000 });
+    const raw = await translateWithClaude(characterAnalysisPrompt(tmdbContext), dialogue, { maxTokens: 3000, model: ANALYSIS_MODEL });
     return parseCharacterLedger(raw);
   } catch (error) {
     console.warn(`[character-analysis] failed, falling back to TMDB only: ${error.message}`);
@@ -687,6 +692,22 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict) {
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
     const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict);
+
+    // When there's no exact hash match, OpenSubtitles returns the same "most downloaded"
+    // generic subtitle no matter which release asked for it — so the source content (and
+    // therefore the correct translation) is identical across releases in that case. Reuse
+    // it instead of re-translating byte-identical text just because videoHash differs.
+    if (!matchedByHash) {
+      const genericKey = buildCacheKey(imdbId, usedLanguage, null);
+      const genericCached = cache.get(genericKey);
+      if (genericCached && genericCached.expiresAt > Date.now()) {
+        console.log(`[translation] ${imdbId}: reusing existing non-hash-matched ${usedLanguage} translation for this release`);
+        cache.set(key, genericCached);
+        saveCacheEntryToDisk(key, genericCached);
+        return genericCached.srt;
+      }
+    }
+
     const source = removeSdh(rawSource);
     console.log(`[translation] ${imdbId}: source language=${usedLanguage}, hash-matched=${Boolean(matchedByHash)}, cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
 
@@ -752,6 +773,13 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict) {
 
     cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
     saveCacheEntryToDisk(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    if (!matchedByHash) {
+      // Let other releases that also fall back to the same generic search reuse this
+      // translation instead of each paying to redo it from scratch.
+      const genericKey = buildCacheKey(imdbId, usedLanguage, null);
+      cache.set(genericKey, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+      saveCacheEntryToDisk(genericKey, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+    }
     deletePartialFromDisk(key);
     partials.delete(key);
     console.log(`[translation] ${imdbId}: completed ${parseSrt(validated).length} cues`);
@@ -1001,6 +1029,7 @@ function createApp() {
     completedJobs: completed.size,
     anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
     anthropicModel: ANTHROPIC_MODEL,
+    analysisModel: ANALYSIS_MODEL,
     chunkSize: CHUNK_SIZE,
     concurrency: TRANSLATION_CONCURRENCY,
     fileTimeoutMs: SUBTITLE_FILE_TIMEOUT_MS,
@@ -1013,6 +1042,25 @@ function createApp() {
 
   app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
 
+  // Starts (or resumes) a translation job for a given cache key, unless one is already
+  // running. Shared by both routes below: /subtitles uses it for the explicit-language
+  // debug path, /subtitle-file uses it to LAZILY start a translation the first time the
+  // person actually opens that specific language's subtitle — not before, so listing three
+  // language options no longer means paying to translate all three "just in case".
+  function startTranslationJob(imdbId, key, sourceLanguage, videoHash, strict) {
+    if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
+    jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
+    ensureKeepAlive();
+    Promise.resolve()
+      .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, strict))
+      .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
+      .catch(error => {
+        const job = jobs.get(key);
+        if (job) { job.error = error.message; job.status = 'failed'; }
+        console.error(`[translation] ${error.message}`);
+      });
+  }
+
   app.get('/subtitle-file/:token.srt', (req, res) => {
     const file = subtitleFiles.get(req.params.token);
     if (!file) return res.sendStatus(404);
@@ -1021,6 +1069,14 @@ function createApp() {
     // as-is, no cache/job lookup needed since nothing is translating it.
     if (file.static) {
       return res.type('application/x-subrip; charset=utf-8').send(file.srt);
+    }
+
+    // Lazy start: this token was listed as a selectable option but no translation was
+    // started for it yet. The very first time someone actually opens THIS specific
+    // language's subtitle, kick off its job now — this is what makes "show three options"
+    // cost the same as "translate one", instead of always translating all three up front.
+    if (file.lazy && (!jobs.has(file.jobKey) || jobs.get(file.jobKey)?.status === 'failed')) {
+      startTranslationJob(file.lazy.imdbId, file.jobKey, file.lazy.sourceLanguage, file.lazy.videoHash, true);
     }
 
     // 1) Fully translated and cached — best case.
@@ -1071,20 +1127,6 @@ function createApp() {
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = { en: 'EN', hr: 'HR', it: 'IT' };
 
-    const startJob = (key, sourceLanguage, strict) => {
-      if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
-      jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
-      ensureKeepAlive();
-      Promise.resolve()
-        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, strict))
-        .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
-        .catch(error => {
-          const job = jobs.get(key);
-          if (job) { job.error = error.message; job.status = 'failed'; }
-          console.error(`[translation] ${error.message}`);
-        });
-    };
-
     const publish = (key, srt, id, label, status = 'ready') => {
       const token = crypto.randomUUID();
       subtitleFiles.set(token, { status, jobKey: key, srt });
@@ -1092,8 +1134,26 @@ function createApp() {
       return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
     };
 
+    // Publishes a token WITHOUT starting any translation job yet. The job only actually
+    // starts the first time this specific token is fetched (see the /subtitle-file route),
+    // so listing multiple language options costs nothing until one is genuinely opened.
+    const publishLazy = (key, sourceLanguage, id, label) => {
+      const token = crypto.randomUUID();
+      subtitleFiles.set(token, { status: 'waiting', jobKey: key, srt: buildPlaceholderSrt(), lazy: { imdbId, sourceLanguage, videoHash } });
+      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
+      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+
+    const publishStatic = (srt, id, label) => {
+      const token = crypto.randomUUID();
+      subtitleFiles.set(token, { status: 'ready', static: true, srt });
+      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
+      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
+    };
+
     // Manual override for testing/debugging a specific source via ?sourceLanguage=en|hr|it —
-    // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch.
+    // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch. This one
+    // starts eagerly since it's an explicit, deliberate request.
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
       const key = buildCacheKey(imdbId, explicitLanguage, videoHash);
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
@@ -1102,23 +1162,34 @@ function createApp() {
       if (cached && cached.expiresAt > Date.now()) {
         return res.json({ subtitles: [publish(key, cached.srt, id, label)] });
       }
-      startJob(key, explicitLanguage, true);
+      startTranslationJob(imdbId, key, explicitLanguage, videoHash, true);
       return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting')] });
     }
 
-    // Default: ONE smart translation per film. Source language is auto-picked (EN priority,
-    // falling back through HR/IT) with exact moviehash verification, so this now gets the
-    // right release-synced subtitle on its own in the common case — no need to eagerly
-    // translate all three languages in parallel just in case one of them was wrong, which
-    // used to cost 3x for every single film regardless of which language actually got used.
-    const key = buildCacheKey(imdbId, null, videoHash);
-    const id = `slo-ai-${type}-${imdbId}`;
-    const cached = cache.get(key);
-    if (cached && cached.expiresAt > Date.now()) {
-      return res.json({ subtitles: [publish(key, cached.srt, id, 'Slovenian AI')] });
-    }
-    startJob(key, null, false);
-    return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, 'Slovenian AI (processing)', 'waiting')] });
+    // Default: offer EN/HR/IT as separate, explicitly-picked options — none of them starts
+    // translating until the person actually opens that specific one, so this costs exactly
+    // the same as translating one language, not three, no matter how many are listed.
+    // Stremio auto-selects the FIRST subtitle for whichever language is clicked, so this
+    // harmless placeholder goes first — it prompts an explicit pick instead of silently and
+    // automatically starting (and billing) a real translation the moment "Slovenian" is
+    // clicked, before the person has actually chosen a source.
+    const choosePlaceholder = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi EN, HR ali IT spodaj v seznamu variant.';
+
+    const subtitles = [
+      publishStatic(choosePlaceholder, `slo-ai-${type}-${imdbId}-choose`, '— Izberi vir spodaj (EN/HR/IT) —'),
+      ...SUPPORTED_SOURCE_LANGUAGES.map(lang => {
+        const key = buildCacheKey(imdbId, lang, videoHash);
+        const id = `slo-ai-${type}-${imdbId}-${lang}`;
+        const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
+        const cached = cache.get(key);
+        if (cached && cached.expiresAt > Date.now()) {
+          return publish(key, cached.srt, id, label);
+        }
+        return publishLazy(key, lang, id, label);
+      })
+    ];
+
+    return res.json({ subtitles });
   });
 
   return app;
