@@ -1,0 +1,71 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  buildGeminiRequest,
+  combineForGemini,
+  CHARACTER_LEDGER_SCHEMA,
+  TRANSLATION_SCHEMA,
+  translateWithGemini
+} = require('../index');
+
+test('combineForGemini puts the shared context first, so repeated chunk calls share a prefix', () => {
+  const combined = combineForGemini('SHARED CONTEXT', 'chunk-specific text');
+  assert.ok(combined.indexOf('SHARED CONTEXT') < combined.indexOf('chunk-specific text'));
+});
+
+test('buildGeminiRequest targets the Interactions API endpoint with the model and input', () => {
+  const request = buildGeminiRequest('hello world', 'gemini-3.7-flash');
+  assert.equal(request.url, 'https://generativelanguage.googleapis.com/v1beta/interactions');
+  assert.equal(request.body.model, 'gemini-3.7-flash');
+  assert.equal(request.body.input, 'hello world');
+  assert.equal(request.body.response_format, undefined);
+});
+
+test('buildGeminiRequest attaches a JSON schema as response_format when provided', () => {
+  const request = buildGeminiRequest('hello', 'gemini-3.7-flash', { schema: TRANSLATION_SCHEMA });
+  assert.equal(request.body.response_format.type, 'text');
+  assert.equal(request.body.response_format.mime_type, 'application/json');
+  assert.deepEqual(request.body.response_format.schema, TRANSLATION_SCHEMA);
+});
+
+test('CHARACTER_LEDGER_SCHEMA requires a characters array with name/gender/confidence', () => {
+  assert.equal(CHARACTER_LEDGER_SCHEMA.type, 'object');
+  assert.ok(CHARACTER_LEDGER_SCHEMA.required.includes('characters'));
+  const itemSchema = CHARACTER_LEDGER_SCHEMA.properties.characters.items;
+  assert.deepEqual(itemSchema.required, ['name', 'gender', 'confidence']);
+  assert.deepEqual(itemSchema.properties.gender.enum, ['male', 'female', 'unknown']);
+});
+
+test('TRANSLATION_SCHEMA requires a translations array of {id, text} pairs', () => {
+  assert.equal(TRANSLATION_SCHEMA.type, 'object');
+  assert.ok(TRANSLATION_SCHEMA.required.includes('translations'));
+  const itemSchema = TRANSLATION_SCHEMA.properties.translations.items;
+  assert.deepEqual(itemSchema.required, ['id', 'text']);
+});
+
+test('translateWithGemini sends x-goog-api-key and reads output_text from the response', async () => {
+  const calls = [];
+  const result = await translateWithGemini('some input', {
+    apiKey: 'test-key',
+    model: 'gemini-3.7-flash',
+    schema: TRANSLATION_SCHEMA,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
+      return { ok: true, json: async () => ({ output_text: '{"translations":[]}' }) };
+    }
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].headers['x-goog-api-key'], 'test-key');
+  assert.equal(calls[0].body.model, 'gemini-3.7-flash');
+  assert.equal(result, '{"translations":[]}');
+});
+
+test('translateWithGemini throws a clear error on a non-ok HTTP response', async () => {
+  await assert.rejects(
+    translateWithGemini('input', {
+      apiKey: 'test-key',
+      fetchImpl: async () => ({ ok: false, status: 429, text: async () => 'rate limited' })
+    }),
+    /Gemini HTTP 429/
+  );
+});

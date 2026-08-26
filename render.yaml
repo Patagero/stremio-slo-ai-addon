@@ -9,11 +9,11 @@ services:
     envVars:
       - key: PORT
         value: 7002
-      - key: ANTHROPIC_MODEL
-        value: claude-sonnet-5
+      - key: GEMINI_MODEL
+        value: gemini-3.7-flash
       - key: PUBLIC_BASE_URL
         sync: false
-      - key: ANTHROPIC_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
       - key: TMDB_API_KEY
         sync: false

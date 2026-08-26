@@ -1,7 +1,7 @@
 # Slo AI Subtitle Translator
 
 Stremio addon that translates English, Croatian or Italian subtitles into natural, gender-correct
-Slovenian, using a two-pass Claude (Anthropic) pipeline plus TMDB cast metadata.
+Slovenian, using a two-pass Gemini pipeline plus TMDB cast metadata.
 
 ## How translation works
 
@@ -9,10 +9,10 @@ Slovenian, using a two-pass Claude (Anthropic) pipeline plus TMDB cast metadata.
    `?sourceLanguage=` (if given) → the title's original TMDB language (en/hr/it) → the remaining
    supported languages. Preferring the original language helps pass 2, since Croatian and Italian
    already mark grammatical gender on verbs.
-2. **Pass 1 — character/gender ledger**: Claude reads the full dialogue plus TMDB cast metadata
+2. **Pass 1 — character/gender ledger**: Gemini reads the full dialogue plus TMDB cast metadata
    (method #5) and returns a structured JSON ledger of every named character with their gender,
    confidence, and supporting evidence (method #4).
-3. **Pass 2 — translation**: Claude translates the subtitles using the ledger as the authoritative
+3. **Pass 2 — translation**: Gemini translates the subtitles using the ledger as the authoritative
    source of truth for on/ona, with an explicit reading-speed budget (characters-per-second) computed
    per cue from its on-screen duration, so lines stay natural-length instead of racing past.
 4. **Reading-speed repair pass**: any cue that comes back over its character budget is sent back for
@@ -25,7 +25,7 @@ Slovenian, using a two-pass Claude (Anthropic) pipeline plus TMDB cast metadata.
 ```sh
 npm install
 npm test
-ANTHROPIC_API_KEY=... TMDB_API_KEY=... OPENSUBTITLES_API_KEY=... PUBLIC_BASE_URL=http://127.0.0.1:7002 npm start
+GEMINI_API_KEY=... TMDB_API_KEY=... OPENSUBTITLES_API_KEY=... PUBLIC_BASE_URL=http://127.0.0.1:7002 npm start
 ```
 
 Install in Stremio with `http://127.0.0.1:7002/manifest.json` on the same PC, or the Mini PC LAN URL from another device.
@@ -33,7 +33,7 @@ Install in Stremio with `http://127.0.0.1:7002/manifest.json` on the same PC, or
 ## Render
 
 Create a new Render Web Service from this repository, use the included Dockerfile, and set
-`PUBLIC_BASE_URL`, `ANTHROPIC_API_KEY`, `TMDB_API_KEY`, and `OPENSUBTITLES_API_KEY` as secrets. The
+`PUBLIC_BASE_URL`, `GEMINI_API_KEY`, `TMDB_API_KEY`, and `OPENSUBTITLES_API_KEY` as secrets. The
 manifest is `/manifest.json`.
 
 It validates cue count, ids and timestamps before returning a translated subtitle.
@@ -45,8 +45,8 @@ service URL.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Claude API key (required) | — |
-| `ANTHROPIC_MODEL` | Claude model id | `claude-sonnet-5` |
+| `GEMINI_API_KEY` | Gemini API key (required) | — |
+| `GEMINI_MODEL` | Gemini model id | `gemini-3.7-flash` |
 | `TMDB_API_KEY` | Cast gender metadata (method #5) | — (falls back to ledger-only) |
 | `OPENSUBTITLES_API_KEY` | Source subtitle downloads | — (required) |
 | `TARGET_CPS` | Target reading speed, characters/second | `17` |

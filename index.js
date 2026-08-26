@@ -15,14 +15,11 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
 // within the same container's lifetime (still better than pure in-memory).
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
-const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || '').trim();
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
-// Pass 1 (character/gender ledger) sends the WHOLE film's dialogue as input but only needs
-// a small structured list back — a cheaper model here meaningfully cuts cost with low risk
-// to overall quality, since Pass 2 (the actual translation, which needs the most nuance)
-// keeps using ANTHROPIC_MODEL above.
-const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'claude-haiku-4-5-20251001';
-const providerConfig = { name: 'anthropic', model: ANTHROPIC_MODEL };
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
+// Same model for both passes, per explicit choice — Gemini 3.7 Flash for everything.
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || GEMINI_MODEL;
+const providerConfig = { name: 'gemini', model: GEMINI_MODEL };
 
 // Ciljna hitrost branja (characters per second). 17 CPS je standardni okvir za odrasle gledalce
 // (Netflix/BBC uporabljata podobne vrednosti). Nižje je počasneje/bolj berljivo.
@@ -47,7 +44,7 @@ const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
   version: '0.5.0',
   name: 'Slo AI Subtitle Translator',
-  description: 'High-quality English, Croatian and Italian to Slovenian subtitles with two-pass, gender-aware AI translation (Claude).',
+  description: 'High-quality English, Croatian and Italian to Slovenian subtitles with two-pass, gender-aware AI translation (Gemini).',
   resources: ['subtitles'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -394,74 +391,49 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
   throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
 }
 
-// ---------- Claude (Anthropic) provider ----------
+// ---------- Gemini provider ----------
 
-function buildClaudeRequest(system, userText, model = ANTHROPIC_MODEL, maxTokens = 8192) {
-  // `system` can be a plain string (no caching) or an array of content blocks, where a
-  // block can carry `cache_control: {type: 'ephemeral'}` to mark it as a prompt-caching
-  // breakpoint. Anthropic caches everything up to and including that block, so repeated
-  // calls that share the same prefix (e.g. the same film's translation context reused
-  // across ~20-25 chunk requests) get billed at ~10% of normal input price for that part.
-  const systemPayload = Array.isArray(system) ? system : system;
+function buildGeminiRequest(inputText, model = GEMINI_MODEL, options = {}) {
+  const body = { model, input: inputText };
+  if (options.schema) {
+    body.response_format = { type: 'text', mime_type: 'application/json', schema: options.schema };
+  }
   return {
-    url: 'https://api.anthropic.com/v1/messages',
-    body: {
-      model,
-      max_tokens: maxTokens,
-      system: systemPayload,
-      messages: [{ role: 'user', content: userText }]
-    }
+    url: 'https://generativelanguage.googleapis.com/v1beta/interactions',
+    body
   };
 }
 
-// Wraps a system prompt string as a single cacheable content block.
-// A full film's translation (~20-26 sequential chunks, each taking several seconds and
-// sometimes needing repair/shortening retries) easily exceeds Anthropic's DEFAULT 5-minute
-// cache lifetime — meaning the cache was likely expiring between chunks and getting
-// rewritten (at a 1.25x SURCHARGE over normal price) instead of ever being read (at 0.1x).
-// Requesting the 1-hour TTL explicitly means we pay the (slightly higher, 2x) write cost
-// ONCE per film, then get the cheap 0.1x read rate for every remaining chunk.
-function cacheableSystemBlock(text) {
-  return [{ type: 'text', text, cache_control: { type: 'ephemeral', ttl: '1h' } }];
+// Gemini's Interactions API has no separate "system" concept the way Anthropic does —
+// everything goes into one "input" string. Putting the large, STABLE/shared context first
+// (before the small, per-call content) maximizes the chance that Gemini's automatic
+// implicit caching — enabled by default for 2.5+ models, no code required, unlike
+// Anthropic's manual cache_control/TTL handling — recognizes and reuses that shared prefix
+// across the ~20-26 chunk calls that make up one film's translation.
+function combineForGemini(sharedContext, perCallContent) {
+  return `${sharedContext}\n\n---\n\n${perCallContent}`;
 }
 
-// Reuses the SAME cached base block (so the cache hit still applies) and appends a small,
-// call-specific addendum (e.g. a repair or shortening instruction) as a second, uncached
-// block — avoids re-paying full price for the large shared context just to add one note.
-function withAddendum(baseText, addendum) {
-  return [
-    { type: 'text', text: baseText, cache_control: { type: 'ephemeral', ttl: '1h' } },
-    { type: 'text', text: addendum }
-  ];
-}
-
-async function translateWithClaude(system, userText, options = {}) {
-  const apiKey = options.apiKey || ANTHROPIC_API_KEY;
-  const model = options.model || ANTHROPIC_MODEL;
-  const maxTokens = options.maxTokens || 8192;
+async function translateWithGemini(inputText, options = {}) {
+  const apiKey = options.apiKey || GEMINI_API_KEY;
+  const model = options.model || GEMINI_MODEL;
   const fetchImpl = options.fetchImpl || fetch;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
-  const request = buildClaudeRequest(system, userText, model, maxTokens);
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
+  const request = buildGeminiRequest(inputText, model, options);
   const response = await fetchImpl(request.url, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01'
+      'x-goog-api-key': apiKey
     },
     body: JSON.stringify(request.body)
   });
   if (!response.ok) {
     const detail = await response.text();
-    throw new Error(`Claude HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    throw new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`);
   }
   const data = await response.json();
-  return (data.content || [])
-    .map(block => block.text || '')
-    .join('')
-    .replace(/^```(?:json|srt|text)?\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim();
+  return String(data.output_text || '').trim();
 }
 
 // ---------- Pass 1: character / gender ledger extraction ----------
@@ -515,14 +487,35 @@ function ledgerToText(characters) {
     .join('\n');
 }
 
+const CHARACTER_LEDGER_SCHEMA = {
+  type: 'object',
+  properties: {
+    characters: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          gender: { type: 'string', enum: ['male', 'female', 'unknown'] },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          note: { type: 'string' }
+        },
+        required: ['name', 'gender', 'confidence']
+      }
+    }
+  },
+  required: ['characters']
+};
+
 async function analyzeCharacters(sourceSrt, meta) {
   const entries = parseSrt(sourceSrt);
   // Plain dialogue lines are enough for this pass and keep the request compact; timestamps
   // and IDs add no value for gender inference.
   const dialogue = entries.map(e => e.text.replace(/\n/g, ' ')).join('\n');
   const tmdbContext = buildMetadataContext(meta);
+  const inputText = combineForGemini(characterAnalysisPrompt(tmdbContext), dialogue);
   try {
-    const raw = await translateWithClaude(characterAnalysisPrompt(tmdbContext), dialogue, { maxTokens: 3000, model: ANALYSIS_MODEL });
+    const raw = await translateWithGemini(inputText, { model: ANALYSIS_MODEL, schema: CHARACTER_LEDGER_SCHEMA });
     return parseCharacterLedger(raw);
   } catch (error) {
     console.warn(`[character-analysis] failed, falling back to TMDB only: ${error.message}`);
@@ -569,15 +562,33 @@ function buildTranslationUserText(sourceEntries) {
     const budget = maxCharsForDuration(cueDurationSeconds(entry));
     return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${entry.text.replace(/\n/g, ' / ')}`;
   });
-  return `Return ONLY a JSON array with exactly one object per source cue: [{"id":"<source id>","text":"Slovenian translation"}]. Use "\\n" inside "text" only if you need a genuine second line. If the Slovenian text itself contains a quotation mark, you MUST escape it as \\" — never leave a bare, unescaped " inside a "text" value, since that breaks the JSON. Never merge or omit entries.
+  return `Translate every source cue below into Slovenian. Return one entry per cue in the "translations" array, with "id" matching the source id exactly. Use "\\n" inside "text" only for a genuine second line. Never merge or omit entries.
 
 SOURCE CUES (duration and character budget shown for each; stay within budget where possible):
 ${lines.join('\n')}`;
 }
 
-// Lenient fallback: pulls out individual {"id":...,"text":"..."} pairs via regex even when
-// the overall JSON array is malformed (most commonly because one translated line contains an
-// unescaped quotation mark). This means one bad line no longer sinks the whole 45-cue chunk.
+const TRANSLATION_SCHEMA = {
+  type: 'object',
+  properties: {
+    translations: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          text: { type: 'string' }
+        },
+        required: ['id', 'text']
+      }
+    }
+  },
+  required: ['translations']
+};
+
+// Lenient fallback kept as a defensive safety net even though Gemini's schema enforcement
+// should make malformed JSON structurally impossible — cheap insurance against network
+// hiccups or partial responses.
 function extractTranslationPairsLoosely(text) {
   const map = new Map();
   const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
@@ -598,20 +609,17 @@ function extractTranslationPairsLoosely(text) {
 
 function parseTranslationJson(value) {
   try {
-    let cleaned = String(value || '').trim();
-    const start = cleaned.indexOf('[');
-    const end = cleaned.lastIndexOf(']');
-    if (start >= 0 && end > start) cleaned = cleaned.slice(start, end + 1);
-    const data = JSON.parse(cleaned);
-    if (Array.isArray(data)) {
+    const data = JSON.parse(String(value || '').trim());
+    const list = Array.isArray(data) ? data : Array.isArray(data?.translations) ? data.translations : null;
+    if (list) {
       const map = new Map();
-      for (const item of data) {
+      for (const item of list) {
         if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
       }
       if (map.size) return map;
     }
   } catch (_) {
-    // Strict parse failed (often one unescaped quote) — fall through to the lenient extractor.
+    // Fall through to the lenient extractor below.
   }
   const loose = extractTranslationPairsLoosely(value);
   return loose.size ? loose : null;
@@ -621,16 +629,17 @@ async function translateChunk(chunk, context) {
   const sourceEntries = chunk.entries || parseSrt(chunk.srt);
   const systemText = systemPrompt(context);
   const userText = buildTranslationUserText(sourceEntries);
-  // systemText is IDENTICAL for every chunk of the same film (same context/ledger), so
-  // marking it cacheable means only the first of ~20-25 calls per film pays full price for
-  // it — every later call (including repair/shortening passes below) reuses the cache.
-  const response = await translateWithClaude(cacheableSystemBlock(systemText), userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+  // systemText is IDENTICAL for every chunk of the same film (same context/ledger). Putting
+  // it FIRST in the combined input lets Gemini's automatic implicit caching (no code
+  // required, unlike Anthropic's manual TTL handling) recognize and reuse that shared
+  // prefix across the ~20-25 calls that make up one film's translation.
+  const response = await translateWithGemini(combineForGemini(systemText, userText), { schema: TRANSLATION_SCHEMA });
   let translated = parseTranslationJson(response);
 
   if (!translated || translated.size !== sourceEntries.length) {
     console.warn(`[translation] chunk ${chunk.index + 1} incomplete (${translated?.size || 0}/${sourceEntries.length}); repairing`);
-    const repairSystem = withAddendum(systemText, 'REPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.');
-    const repaired = await translateWithClaude(repairSystem, userText, { maxTokens: Math.min(8192, sourceEntries.length * 120 + 500) });
+    const repairInput = combineForGemini(systemText, `${userText}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.`);
+    const repaired = await translateWithGemini(repairInput, { schema: TRANSLATION_SCHEMA });
     translated = parseTranslationJson(repaired) || translated || new Map();
   }
 
@@ -640,14 +649,14 @@ async function translateChunk(chunk, context) {
     text: translated.get(String(entry.id)) || entry.text
   }));
 
-  // Reading-speed repair pass: ask Claude to shorten only the cues that are over budget.
+  // Reading-speed repair pass: ask Gemini to shorten only the cues that are over budget.
   const tooFast = findTooFastCues(resultEntries);
   if (tooFast.length) {
     console.warn(`[translation] chunk ${chunk.index + 1}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
-    const shortenSystem = withAddendum(systemText, 'SHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same JSON array format as before, one object per listed id.');
+    const shortenNote = 'SHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same "translations" format as before, one entry per listed id.';
     const shortenUserText = tooFast.map(c => `[id=${c.id} max_chars=${c.budget}] ${c.text.replace(/\n/g, ' / ')}`).join('\n');
     try {
-      const shortenedRaw = await translateWithClaude(shortenSystem, shortenUserText, { maxTokens: Math.min(4096, tooFast.length * 150 + 300) });
+      const shortenedRaw = await translateWithGemini(combineForGemini(systemText, `${shortenNote}\n\n${shortenUserText}`), { schema: TRANSLATION_SCHEMA });
       const shortenedMap = parseTranslationJson(shortenedRaw);
       if (shortenedMap) {
         resultEntries = resultEntries.map(entry => shortenedMap.has(String(entry.id)) ? { ...entry, text: shortenedMap.get(String(entry.id)) } : entry);
@@ -672,7 +681,7 @@ async function translateChunk(chunk, context) {
 // the same film would incorrectly share one cached translation timed for only one of them.
 function buildCacheKey(imdbId, sourceLanguage, videoHash) {
   const idPart = videoHash ? `${imdbId}:${videoHash}` : imdbId;
-  return `${idPart}:${sourceLanguage || 'auto'}:slv:anthropic:${ANTHROPIC_MODEL}`;
+  return `${idPart}:${sourceLanguage || 'auto'}:slv:gemini:${GEMINI_MODEL}`;
 }
 
 // Stremio sends extra request parameters (filename, videoSize, videoHash) as a single
@@ -721,7 +730,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict) {
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
 
     const chunks = chunkSrt(source, CHUNK_SIZE);
-    console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${ANTHROPIC_MODEL}`);
+    console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${GEMINI_MODEL}`);
 
     const sourceEntries = parseSrt(source);
     const sourceIds = sourceEntries.map(e => e.id);
@@ -945,9 +954,9 @@ function deletePartialFromDisk(key) {
 // actionable failure causes (out of AI credits, rate limited, missing config, no subtitles).
 function friendlyErrorMessage(raw) {
   const msg = String(raw || '');
-  if (/credit/i.test(msg)) return 'Zmanjkalo je AI kreditov (Anthropic). Dopolni kredit na console.anthropic.com in poskusi znova.';
+  if (/credit|quota|resource_exhausted/i.test(msg)) return 'Zmanjkalo je AI kvote/kreditov. Preveri Google AI Studio / Gemini API konzolo in poskusi znova.';
   if (/rate.?limit|429/i.test(msg)) return 'Trenutno preveč hkratnih zahtev do AI (rate limit). Poskusi znova čez nekaj minut.';
-  if (/ANTHROPIC_API_KEY/i.test(msg)) return 'Manjka ali je neveljaven Anthropic API ključ na strežniku.';
+  if (/GEMINI_API_KEY/i.test(msg)) return 'Manjka ali je neveljaven Gemini API ključ na strežniku.';
   if (/No subtitle found/i.test(msg)) return 'Za ta film ni bilo mogoče najti izvirnih podnapisov (HR/IT/EN).';
   return msg || 'Translation failed';
 }
@@ -1033,8 +1042,8 @@ function createApp() {
     cacheEntries: cache.size,
     processingJobs: jobs.size,
     completedJobs: completed.size,
-    anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
-    anthropicModel: ANTHROPIC_MODEL,
+    geminiConfigured: Boolean(GEMINI_API_KEY),
+    geminiModel: GEMINI_MODEL,
     analysisModel: ANALYSIS_MODEL,
     chunkSize: CHUNK_SIZE,
     concurrency: TRANSLATION_CONCURRENCY,
@@ -1046,7 +1055,7 @@ function createApp() {
     cacheDir: CACHE_DIR
   }));
 
-  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
+  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator</h1><p>Configure API keys in Render environment variables (GEMINI_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
 
   // Starts (or resumes) a translation job for a given cache key, unless one is already
   // running. Shared by both routes below: /subtitles uses it for the explicit-language
@@ -1222,10 +1231,11 @@ module.exports = {
   CHUNK_SIZE,
   TRANSLATION_CONCURRENCY,
   SUBTITLE_FILE_TIMEOUT_MS,
-  ANTHROPIC_MODEL,
+  GEMINI_MODEL,
   providerConfig,
-  buildClaudeRequest,
-  translateWithClaude,
+  buildGeminiRequest,
+  translateWithGemini,
+  combineForGemini,
   characterAnalysisPrompt,
   parseCharacterLedger,
   ledgerToText,
@@ -1261,8 +1271,8 @@ module.exports = {
   statusNoticeSrt,
   buildCacheKey,
   parseExtraHash,
-  cacheableSystemBlock,
-  withAddendum,
+  CHARACTER_LEDGER_SCHEMA,
+  TRANSLATION_SCHEMA,
   withOpenSubtitlesLimit,
   fetchOpenSubtitleForLanguage
 };

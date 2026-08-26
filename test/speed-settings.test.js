@@ -8,8 +8,8 @@ test('speed settings use large chunks, bounded parallelism, and a long file time
   assert.ok(SUBTITLE_FILE_TIMEOUT_MS >= 300000);
 });
 
-test('translation uses the configured Anthropic provider', () => {
-  const { providerConfig, ANTHROPIC_MODEL } = require('../index');
-  assert.equal(providerConfig.name, 'anthropic');
-  assert.equal(providerConfig.model, ANTHROPIC_MODEL);
+test('translation uses the configured Gemini provider', () => {
+  const { providerConfig, GEMINI_MODEL } = require('../index');
+  assert.equal(providerConfig.name, 'gemini');
+  assert.equal(providerConfig.model, GEMINI_MODEL);
 });
