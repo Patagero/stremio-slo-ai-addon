@@ -5,8 +5,21 @@ const {
   combineForGemini,
   CHARACTER_LEDGER_SCHEMA,
   TRANSLATION_SCHEMA,
+  buildTranslationSchema,
   translateWithGemini
 } = require('../index');
+
+test('buildTranslationSchema pins minItems and maxItems to the exact expected count', () => {
+  const schema = buildTranslationSchema(45);
+  assert.equal(schema.properties.translations.minItems, 45);
+  assert.equal(schema.properties.translations.maxItems, 45);
+});
+
+test('buildTranslationSchema adapts to a different count for the shortening pass', () => {
+  const schema = buildTranslationSchema(3);
+  assert.equal(schema.properties.translations.minItems, 3);
+  assert.equal(schema.properties.translations.maxItems, 3);
+});
 
 test('combineForGemini puts the shared context first, so repeated chunk calls share a prefix', () => {
   const combined = combineForGemini('SHARED CONTEXT', 'chunk-specific text');

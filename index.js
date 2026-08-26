@@ -568,23 +568,33 @@ SOURCE CUES (duration and character budget shown for each; stay within budget wh
 ${lines.join('\n')}`;
 }
 
-const TRANSLATION_SCHEMA = {
-  type: 'object',
-  properties: {
-    translations: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string' },
-          text: { type: 'string' }
-        },
-        required: ['id', 'text']
+// minItems/maxItems are set dynamically per call (see buildTranslationSchema) to exactly
+// match the number of source cues — without this, the schema only constrains the SHAPE of
+// each item, not the COUNT, so Gemini could return a shorter-but-valid array that still
+// passes schema validation while being incomplete for our purposes.
+function buildTranslationSchema(expectedCount) {
+  return {
+    type: 'object',
+    properties: {
+      translations: {
+        type: 'array',
+        minItems: expectedCount,
+        maxItems: expectedCount,
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            text: { type: 'string' }
+          },
+          required: ['id', 'text']
+        }
       }
-    }
-  },
-  required: ['translations']
-};
+    },
+    required: ['translations']
+  };
+}
+// Kept for anything that needs a generic (unbounded-count) schema, e.g. tests.
+const TRANSLATION_SCHEMA = buildTranslationSchema(undefined);
 
 // Lenient fallback kept as a defensive safety net even though Gemini's schema enforcement
 // should make malformed JSON structurally impossible — cheap insurance against network
@@ -629,17 +639,18 @@ async function translateChunk(chunk, context) {
   const sourceEntries = chunk.entries || parseSrt(chunk.srt);
   const systemText = systemPrompt(context);
   const userText = buildTranslationUserText(sourceEntries);
+  const fullSchema = buildTranslationSchema(sourceEntries.length);
   // systemText is IDENTICAL for every chunk of the same film (same context/ledger). Putting
   // it FIRST in the combined input lets Gemini's automatic implicit caching (no code
   // required, unlike Anthropic's manual TTL handling) recognize and reuse that shared
   // prefix across the ~20-25 calls that make up one film's translation.
-  const response = await translateWithGemini(combineForGemini(systemText, userText), { schema: TRANSLATION_SCHEMA });
+  const response = await translateWithGemini(combineForGemini(systemText, userText), { schema: fullSchema });
   let translated = parseTranslationJson(response);
 
   if (!translated || translated.size !== sourceEntries.length) {
     console.warn(`[translation] chunk ${chunk.index + 1} incomplete (${translated?.size || 0}/${sourceEntries.length}); repairing`);
     const repairInput = combineForGemini(systemText, `${userText}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once.`);
-    const repaired = await translateWithGemini(repairInput, { schema: TRANSLATION_SCHEMA });
+    const repaired = await translateWithGemini(repairInput, { schema: fullSchema });
     translated = parseTranslationJson(repaired) || translated || new Map();
   }
 
@@ -653,10 +664,11 @@ async function translateChunk(chunk, context) {
   const tooFast = findTooFastCues(resultEntries);
   if (tooFast.length) {
     console.warn(`[translation] chunk ${chunk.index + 1}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
+    const shortenSchema = buildTranslationSchema(tooFast.length);
     const shortenNote = 'SHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars while preserving meaning and correct gender. Return the same "translations" format as before, one entry per listed id.';
     const shortenUserText = tooFast.map(c => `[id=${c.id} max_chars=${c.budget}] ${c.text.replace(/\n/g, ' / ')}`).join('\n');
     try {
-      const shortenedRaw = await translateWithGemini(combineForGemini(systemText, `${shortenNote}\n\n${shortenUserText}`), { schema: TRANSLATION_SCHEMA });
+      const shortenedRaw = await translateWithGemini(combineForGemini(systemText, `${shortenNote}\n\n${shortenUserText}`), { schema: shortenSchema });
       const shortenedMap = parseTranslationJson(shortenedRaw);
       if (shortenedMap) {
         resultEntries = resultEntries.map(entry => shortenedMap.has(String(entry.id)) ? { ...entry, text: shortenedMap.get(String(entry.id)) } : entry);
@@ -1273,6 +1285,7 @@ module.exports = {
   parseExtraHash,
   CHARACTER_LEDGER_SCHEMA,
   TRANSLATION_SCHEMA,
+  buildTranslationSchema,
   withOpenSubtitlesLimit,
   fetchOpenSubtitleForLanguage
 };
