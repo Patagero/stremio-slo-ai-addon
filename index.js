@@ -1071,12 +1071,12 @@ function createApp() {
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = { en: 'EN', hr: 'HR', it: 'IT' };
 
-    const startJob = (key, sourceLanguage) => {
+    const startJob = (key, sourceLanguage, strict) => {
       if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
       jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
       ensureKeepAlive();
       Promise.resolve()
-        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, true))
+        .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, strict))
         .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
         .catch(error => {
           const job = jobs.get(key);
@@ -1092,20 +1092,8 @@ function createApp() {
       return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
     };
 
-    // A static, harmless first entry. Stremio auto-selects the FIRST subtitle for whichever
-    // language the person clicks — with three real EN/HR/IT translations, that meant it was
-    // silently starting playback with English every time, before the person got a chance to
-    // choose. Putting this instructional placeholder first means Stremio "auto-selects"
-    // this instead, prompting an explicit pick rather than a silent default.
-    const publishStatic = (srt, id, label) => {
-      const token = crypto.randomUUID();
-      subtitleFiles.set(token, { status: 'ready', static: true, srt });
-      setTimeout(() => subtitleFiles.delete(token), CACHE_TTL_MS).unref?.();
-      return { id, url: `${root}/subtitle-file/${token}.srt`, lang: 'slv', label };
-    };
-
-    // If a specific source language was requested via ?sourceLanguage=, keep the previous
-    // single-result behavior (used by the health-check style manual testing flow).
+    // Manual override for testing/debugging a specific source via ?sourceLanguage=en|hr|it —
+    // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch.
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
       const key = buildCacheKey(imdbId, explicitLanguage, videoHash);
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
@@ -1114,33 +1102,23 @@ function createApp() {
       if (cached && cached.expiresAt > Date.now()) {
         return res.json({ subtitles: [publish(key, cached.srt, id, label)] });
       }
-      startJob(key, explicitLanguage);
+      startJob(key, explicitLanguage, true);
       return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting')] });
     }
 
-    // Default: offer one Slovenian track PER source language (EN/HR/IT) side by side in
-    // Stremio's subtitle picker, so if one turns out mistimed (e.g. no exact hash match for
-    // that language), the person can just pick a different source without waiting on us.
-    // Stays visible for the whole runtime (not just 4s) so it's impossible to miss if left
-    // selected by accident — nudging the person toward the real EN/HR/IT variants below.
-    const choosePlaceholder = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi EN, HR ali IT spodaj v seznamu variant.';
-
-    const subtitles = [
-      publishStatic(choosePlaceholder, `slo-ai-${type}-${imdbId}-choose`, '— Izberi vir spodaj (EN/HR/IT) —'),
-      ...SUPPORTED_SOURCE_LANGUAGES.map(lang => {
-        const key = buildCacheKey(imdbId, lang, videoHash);
-        const id = `slo-ai-${type}-${imdbId}-${lang}`;
-        const label = `Slovenian AI · ${sourceLangLabel[lang]}`;
-        const cached = cache.get(key);
-        if (cached && cached.expiresAt > Date.now()) {
-          return publish(key, cached.srt, id, label);
-        }
-        startJob(key, lang);
-        return publish(key, buildPlaceholderSrt(), id, `${label} (processing)`, 'waiting');
-      })
-    ];
-
-    return res.json({ subtitles });
+    // Default: ONE smart translation per film. Source language is auto-picked (EN priority,
+    // falling back through HR/IT) with exact moviehash verification, so this now gets the
+    // right release-synced subtitle on its own in the common case — no need to eagerly
+    // translate all three languages in parallel just in case one of them was wrong, which
+    // used to cost 3x for every single film regardless of which language actually got used.
+    const key = buildCacheKey(imdbId, null, videoHash);
+    const id = `slo-ai-${type}-${imdbId}`;
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json({ subtitles: [publish(key, cached.srt, id, 'Slovenian AI')] });
+    }
+    startJob(key, null, false);
+    return res.json({ subtitles: [publish(key, buildPlaceholderSrt(), id, 'Slovenian AI (processing)', 'waiting')] });
   });
 
   return app;
