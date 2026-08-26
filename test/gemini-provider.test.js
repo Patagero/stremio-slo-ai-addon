@@ -6,8 +6,42 @@ const {
   CHARACTER_LEDGER_SCHEMA,
   TRANSLATION_SCHEMA,
   buildTranslationSchema,
-  translateWithGemini
+  translateWithGemini,
+  extractOutputText
 } = require('../index');
+
+test('extractOutputText reads text from the real REST response shape (steps[].content[].text)', () => {
+  // This is the ACTUAL shape documented for the raw REST API — "output_text" is only an
+  // SDK convenience property and does NOT exist as a field on the raw JSON response.
+  const realResponse = {
+    id: 'v1_abc',
+    status: 'completed',
+    steps: [
+      { type: 'thought', signature: 'xyz' },
+      { type: 'model_output', content: [{ type: 'text', text: 'hello world' }] }
+    ],
+    object: 'interaction',
+    model: 'gemini-3.7-flash'
+  };
+  assert.equal(extractOutputText(realResponse), 'hello world');
+});
+
+test('extractOutputText concatenates multiple text parts across model_output steps', () => {
+  const response = {
+    steps: [
+      { type: 'model_output', content: [{ type: 'text', text: 'part one ' }] },
+      { type: 'model_output', content: [{ type: 'text', text: 'part two' }] }
+    ]
+  };
+  assert.equal(extractOutputText(response), 'part one part two');
+});
+
+test('extractOutputText returns an empty string for missing/malformed steps rather than throwing', () => {
+  assert.equal(extractOutputText({}), '');
+  assert.equal(extractOutputText({ steps: [] }), '');
+  assert.equal(extractOutputText({ steps: [{ type: 'thought' }] }), '');
+  assert.equal(extractOutputText(null), '');
+});
 
 test('buildTranslationSchema pins minItems and maxItems to the exact expected count', () => {
   const schema = buildTranslationSchema(45);
@@ -56,7 +90,7 @@ test('TRANSLATION_SCHEMA requires a translations array of {id, text} pairs', () 
   assert.deepEqual(itemSchema.required, ['id', 'text']);
 });
 
-test('translateWithGemini sends x-goog-api-key and reads output_text from the response', async () => {
+test('translateWithGemini sends x-goog-api-key and reads text from the real steps[] response shape', async () => {
   const calls = [];
   const result = await translateWithGemini('some input', {
     apiKey: 'test-key',
@@ -64,7 +98,12 @@ test('translateWithGemini sends x-goog-api-key and reads output_text from the re
     schema: TRANSLATION_SCHEMA,
     fetchImpl: async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
-      return { ok: true, json: async () => ({ output_text: '{"translations":[]}' }) };
+      return {
+        ok: true,
+        json: async () => ({
+          steps: [{ type: 'model_output', content: [{ type: 'text', text: '{"translations":[]}' }] }]
+        })
+      };
     }
   });
   assert.equal(calls.length, 1);

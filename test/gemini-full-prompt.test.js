@@ -25,7 +25,12 @@ test('Gemini provider is used and receives the current SRT chunk', async () => {
     apiKey: 'test-key',
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
-      return { ok: true, json: async () => ({ output_text: '{"translations":[{"id":"1","text":"Živjo"}]}' }) };
+      return {
+        ok: true,
+        json: async () => ({
+          steps: [{ type: 'model_output', content: [{ type: 'text', text: '{"translations":[{"id":"1","text":"Živjo"}]}' }] }]
+        })
+      };
     }
   });
   assert.equal(result.includes('Živjo'), true);

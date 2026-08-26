@@ -412,6 +412,20 @@ function combineForGemini(sharedContext, perCallContent) {
   return `${sharedContext}\n\n---\n\n${perCallContent}`;
 }
 
+// The raw REST response has NO top-level "output_text" field — that's an SDK-only
+// convenience property. The actual response shape is:
+// { steps: [ { type: 'model_output', content: [ { type: 'text', text: '...' } ] } ] }
+// We concatenate all text parts across all model_output steps, in case of multi-part output.
+function extractOutputText(data) {
+  const steps = Array.isArray(data?.steps) ? data.steps : [];
+  return steps
+    .filter(step => step?.type === 'model_output')
+    .flatMap(step => (Array.isArray(step.content) ? step.content : []))
+    .filter(part => part?.type === 'text')
+    .map(part => part.text || '')
+    .join('');
+}
+
 async function translateWithGemini(inputText, options = {}) {
   const apiKey = options.apiKey || GEMINI_API_KEY;
   const model = options.model || GEMINI_MODEL;
@@ -431,7 +445,7 @@ async function translateWithGemini(inputText, options = {}) {
     throw new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`);
   }
   const data = await response.json();
-  return String(data.output_text || '').trim();
+  return extractOutputText(data).trim();
 }
 
 // ---------- Pass 1: character / gender ledger extraction ----------
@@ -1226,6 +1240,7 @@ module.exports = {
   providerConfig,
   buildGeminiRequest,
   translateWithGemini,
+  extractOutputText,
   combineForGemini,
   characterAnalysisPrompt,
   parseCharacterLedger,
