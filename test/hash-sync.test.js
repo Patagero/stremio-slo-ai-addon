@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseExtraHash, buildCacheKey } = require('../index');
+const { parseExtraHash, buildCacheKey, parseSeriesId } = require('../index');
 
 test('parseExtraHash extracts videoHash and videoSize regardless of field order', () => {
   const a = parseExtraHash('filename=Movie.mkv&videoSize=123456&videoHash=dd630e246fb4d8d0');
@@ -28,4 +28,20 @@ test('buildCacheKey includes the video hash when available, so different release
 test('buildCacheKey falls back to imdbId-only when no hash is available', () => {
   const key = buildCacheKey('tt8814476', null, null);
   assert.match(key, /^tt8814476:auto:slv:/);
+});
+
+test('parseSeriesId splits a Stremio series id into imdbId, season and episode', () => {
+  assert.deepEqual(parseSeriesId('tt1234567:2:5'), { imdbId: 'tt1234567', season: '2', episode: '5' });
+});
+
+test('parseSeriesId treats a plain movie id as having no season/episode', () => {
+  assert.deepEqual(parseSeriesId('tt1234567'), { imdbId: 'tt1234567', season: null, episode: null });
+});
+
+test('buildCacheKey includes season/episode, so different episodes of the same show never share a translation', () => {
+  const ep1 = buildCacheKey('tt1234567', 'en', null, '1', '1');
+  const ep2 = buildCacheKey('tt1234567', 'en', null, '1', '2');
+  assert.notEqual(ep1, ep2);
+  assert.match(ep1, /^tt1234567:s1e1:/);
+  assert.match(ep2, /^tt1234567:s1e2:/);
 });

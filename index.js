@@ -323,13 +323,19 @@ function withOpenSubtitlesLimit(task) {
   return run;
 }
 
-async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash) {
-  return withOpenSubtitlesLimit(() => fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash));
+async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode) {
+  return withOpenSubtitlesLimit(() => fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode));
 }
 
-async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash) {
+async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode) {
   const headers = await openSubtitlesHeaders();
   const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: language, order_by: 'downloads', order_direction: 'desc' };
+  // Series subtitles are indexed per-episode on OpenSubtitles — without these, a search by
+  // the show's imdb_id alone returns nothing (or, on some setups, an arbitrary episode).
+  if (season && episode) {
+    baseParams.season_number = season;
+    baseParams.episode_number = episode;
+  }
 
   // Prefer an EXACT hash match first. Different releases of the same movie (BluRay vs
   // WEBDL, theatrical vs extended cut, different intro/logo lengths) are very often NOT in
@@ -364,8 +370,8 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash)
     }
   }
 
-  // Fall back to a generic, most-downloaded subtitle for the movie. Better than nothing,
-  // but sync with this exact file is not guaranteed.
+  // Fall back to a generic, most-downloaded subtitle for the movie/episode. Better than
+  // nothing, but sync with this exact file is not guaranteed.
   const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', { headers, params: baseParams });
   const file = search.data.data?.[0]?.attributes?.files?.[0];
   if (!file?.file_id) return null;
@@ -375,12 +381,12 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash)
   return { srt, language, matchedByHash: false };
 }
 
-async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict) {
+async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
   const languages = resolveSourceLanguages(meta, requestedLanguage, strict);
   for (const language of languages) {
     try {
-      const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash);
+      const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode);
       if (found) return found;
     } catch (error) {
       console.warn(`[opensubtitles] ${imdbId} (${language}) failed: ${error.message}`);
@@ -712,8 +718,19 @@ async function translateChunk(chunk, context) {
 // theatrical vs extended cut, etc.), so once we're matching subtitles by exact video hash,
 // the cache/job key needs to include that hash too — otherwise two different releases of
 // the same film would incorrectly share one cached translation timed for only one of them.
-function buildCacheKey(imdbId, sourceLanguage, videoHash) {
-  const idPart = videoHash ? `${imdbId}:${videoHash}` : imdbId;
+// Stremio sends series ids as "tt1234567:season:episode" — splitting this out is required
+// before using the id anywhere else (TMDB, OpenSubtitles), since neither accepts the raw
+// combined string as a valid imdb_id. Movies have no season/episode suffix.
+function parseSeriesId(rawId) {
+  const str = String(rawId || '');
+  const match = str.match(/^(tt\d+):(\d+):(\d+)$/);
+  if (match) return { imdbId: match[1], season: match[2], episode: match[3] };
+  return { imdbId: str, season: null, episode: null };
+}
+
+function buildCacheKey(imdbId, sourceLanguage, videoHash, season, episode) {
+  const episodePart = season && episode ? `:s${season}e${episode}` : '';
+  const idPart = videoHash ? `${imdbId}${episodePart}:${videoHash}` : `${imdbId}${episodePart}`;
   return `${idPart}:${sourceLanguage || 'auto'}:slv:gemini:${GEMINI_MODEL}`;
 }
 
@@ -731,22 +748,22 @@ function parseExtraHash(extra) {
   };
 }
 
-async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict) {
-  const key = buildCacheKey(imdbId, sourceLanguage, videoHash);
+async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, season, episode) {
+  const key = buildCacheKey(imdbId, sourceLanguage, videoHash, season, episode);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.srt;
   if (inflight.has(key)) return inflight.get(key);
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
-    const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict);
+    const { srt: rawSource, language: usedLanguage, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode);
 
     // When there's no exact hash match, OpenSubtitles returns the same "most downloaded"
     // generic subtitle no matter which release asked for it — so the source content (and
     // therefore the correct translation) is identical across releases in that case. Reuse
     // it instead of re-translating byte-identical text just because videoHash differs.
     if (!matchedByHash) {
-      const genericKey = buildCacheKey(imdbId, usedLanguage, null);
+      const genericKey = buildCacheKey(imdbId, usedLanguage, null, season, episode);
       const genericCached = cache.get(genericKey);
       if (genericCached && genericCached.expiresAt > Date.now()) {
         console.log(`[translation] ${imdbId}: reusing existing non-hash-matched ${usedLanguage} translation for this release`);
@@ -1099,12 +1116,12 @@ function createApp() {
   // debug path, /subtitle-file uses it to LAZILY start a translation the first time the
   // person actually opens that specific language's subtitle — not before, so listing three
   // language options no longer means paying to translate all three "just in case".
-  function startTranslationJob(imdbId, key, sourceLanguage, videoHash, strict) {
+  function startTranslationJob(imdbId, key, sourceLanguage, videoHash, strict, season, episode) {
     if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
     jobs.set(key, { status: 'processing', startedAt: Date.now(), error: null });
     ensureKeepAlive();
     Promise.resolve()
-      .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, strict))
+      .then(() => translateSubtitle(imdbId, sourceLanguage, videoHash, strict, season, episode))
       .then(() => { completed.set(key, { status: 'completed', finishedAt: Date.now() }); })
       .catch(error => {
         const job = jobs.get(key);
@@ -1123,14 +1140,16 @@ function createApp() {
     const { imdbId } = req.params;
     const lang = req.params.lang;
     const videoHash = req.query.hash ? String(req.query.hash) : null;
+    const season = req.query.season ? String(req.query.season) : null;
+    const episode = req.query.episode ? String(req.query.episode) : null;
 
     if (lang === 'choose') {
       return res.type('application/x-subrip; charset=utf-8').send(CHOOSE_PLACEHOLDER_SRT);
     }
     if (!SUPPORTED_SOURCE_LANGUAGES.includes(lang)) return res.sendStatus(404);
 
-    const key = buildCacheKey(imdbId, lang, videoHash);
-    startTranslationJob(imdbId, key, lang, videoHash, true);
+    const key = buildCacheKey(imdbId, lang, videoHash, season, episode);
+    startTranslationJob(imdbId, key, lang, videoHash, true, season, episode);
 
     // 1) Fully translated and cached — best case.
     const finalEntry = cache.get(key);
@@ -1169,7 +1188,12 @@ function createApp() {
   app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
     console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
     const type = req.params[0];
-    const imdbId = req.params[1].replace(/\.json$/i, '');
+    const rawId = req.params[1].replace(/\.json$/i, '');
+    // Stremio sends series ids as "tt1234567:season:episode" — this MUST be split out
+    // before use, since neither TMDB nor OpenSubtitles accept the combined string as a
+    // valid imdb_id (this was previously silently broken: series requests searched with a
+    // malformed id and could return nothing, or an unrelated episode's subtitles).
+    const { imdbId, season, episode } = parseSeriesId(rawId);
     const explicitLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
     // Stremio passes the OpenSubtitles-compatible file hash for the exact video the person
     // is playing — using it lets us fetch a subtitle that is actually in sync with THIS
@@ -1177,11 +1201,15 @@ function createApp() {
     const videoHash = parseExtraHash(req.params[2]).videoHash;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = { en: 'EN', hr: 'HR', it: 'IT' };
-    const hashQuery = videoHash ? `?hash=${encodeURIComponent(videoHash)}` : '';
+    const extraQuery = [
+      videoHash ? `hash=${encodeURIComponent(videoHash)}` : null,
+      season && episode ? `season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}` : null
+    ].filter(Boolean).join('&');
+    const queryString = extraQuery ? `?${extraQuery}` : '';
 
     // Self-describing URL — no token registry, so this survives any restart/redeploy that
     // wipes in-memory state, since the URL itself contains everything /subtitle-file needs.
-    const buildUrl = lang => `${root}/subtitle-file/${encodeURIComponent(imdbId)}/${lang}.srt${hashQuery}`;
+    const buildUrl = lang => `${root}/subtitle-file/${encodeURIComponent(imdbId)}/${lang}.srt${queryString}`;
 
     // Manual override for testing/debugging a specific source via ?sourceLanguage=en|hr|it —
     // not exposed anywhere in Stremio's own UI, just a URL-level escape hatch.
@@ -1276,6 +1304,7 @@ module.exports = {
   friendlyErrorMessage,
   statusNoticeSrt,
   buildCacheKey,
+  parseSeriesId,
   parseExtraHash,
   CHARACTER_LEDGER_SCHEMA,
   TRANSLATION_SCHEMA,
