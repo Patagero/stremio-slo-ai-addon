@@ -2,6 +2,62 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
+
+function secondsToTimecode(sec) {
+  const totalMs = Math.round(sec * 1000);
+  const hours = Math.floor(totalMs / 3600000);
+  const minutes = Math.floor((totalMs % 3600000) / 60000);
+  const seconds = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+async function runLocalWhisperExtraction(streamUrl, startSec = 0, durationSec = 120, modelSize = 'small') {
+  return new Promise((resolve) => {
+    const pythonScript = path.join(__dirname, 'whisper-engine.py');
+    const pyProc = spawn('python', [
+      pythonScript,
+      '--url', streamUrl,
+      '--start', String(startSec),
+      '--duration', String(durationSec),
+      '--model', modelSize
+    ]);
+
+    let stdout = '';
+    let stderr = '';
+    pyProc.stdout.on('data', data => { stdout += data; });
+    pyProc.stderr.on('data', data => { stderr += data; });
+
+    pyProc.on('close', code => {
+      if (code !== 0) {
+        console.warn(`[whisper-local] failed with code ${code}: ${stderr}`);
+        return resolve(null);
+      }
+      try {
+        const parsed = JSON.parse(stdout);
+        if (parsed.error || !Array.isArray(parsed.cues) || !parsed.cues.length) {
+          console.warn(`[whisper-local] returned error or no cues: ${parsed.error || '0 cues'}`);
+          return resolve(null);
+        }
+        const entries = parsed.cues.map((c, i) => ({
+          id: String(i + 1),
+          timecode: `${secondsToTimecode(c.start)} --> ${secondsToTimecode(c.end)}`,
+          text: c.text
+        }));
+        return resolve(toSrt(entries));
+      } catch (err) {
+        console.warn(`[whisper-local] JSON parse error: ${err.message}`);
+        return resolve(null);
+      }
+    });
+
+    pyProc.on('error', err => {
+      console.warn(`[whisper-local] spawn error: ${err.message}`);
+      return resolve(null);
+    });
+  });
+}
 
 const PORT = Number(process.env.PORT || 7002);
 const CHUNK_SIZE = Math.max(40, Math.min(50, Number(process.env.CHUNK_SIZE || 45)));
@@ -1170,5 +1226,7 @@ module.exports = {
   TRANSLATION_SCHEMA,
   buildTranslationSchema,
   withOpenSubtitlesLimit,
-  fetchOpenSubtitleForLanguage
+  fetchOpenSubtitleForLanguage,
+  runLocalWhisperExtraction,
+  secondsToTimecode
 };
