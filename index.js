@@ -67,10 +67,19 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000)
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 // Sonnet 5.5 konfiguracija
-const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '').trim();
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022';
+const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.OPENROUTER_API_KEY || '').trim();
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || ANTHROPIC_MODEL;
 const providerConfig = { name: 'anthropic', model: ANTHROPIC_MODEL };
+
+const CLAUDE_FALLBACK_MODELS = [
+  ANTHROPIC_MODEL,
+  'claude-3-5-sonnet-latest',
+  'claude-3-7-sonnet-latest',
+  'claude-3-5-sonnet-20240620',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-haiku-latest'
+];
 
 // Ciljna hitrost branja (characters per second). 17 CPS je standardni okvir za odrasle gledalce.
 const TARGET_CPS = Number(process.env.TARGET_CPS || 17);
@@ -428,27 +437,68 @@ function extractClaudeOutputText(data) {
 
 async function translateWithClaude(systemText, userText, options = {}) {
   const apiKey = options.apiKey || ANTHROPIC_API_KEY;
-  const model = options.model || ANTHROPIC_MODEL;
   const fetchImpl = options.fetchImpl || fetch;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured');
 
-  const request = buildClaudeRequest(systemText, userText, model, options.maxTokens || 4096);
-  const response = await fetchImpl(request.url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify(request.body)
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`Anthropic HTTP ${response.status}: ${detail.slice(0, 300)}`);
+  // Prepoznaj OpenRouter ključ
+  const isOpenRouter = apiKey.startsWith('sk-or-') || process.env.OPENROUTER_API_KEY;
+  if (isOpenRouter) {
+    const orModel = options.model || (process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet');
+    const response = await fetchImpl('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: orModel,
+        messages: [
+          { role: 'system', content: systemText },
+          { role: 'user', content: userText }
+        ]
+      })
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`OpenRouter HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    }
+    const data = await response.json();
+    return (data.choices?.[0]?.message?.content || '').trim();
   }
-  const data = await response.json();
-  return extractClaudeOutputText(data).trim();
+
+  // Anthropic Messages API z verigo modelov ob 404
+  const requestedModel = options.model || ANTHROPIC_MODEL;
+  const modelsToTry = [requestedModel, ...CLAUDE_FALLBACK_MODELS.filter(m => m !== requestedModel)];
+  let lastError = null;
+
+  for (const currentModel of modelsToTry) {
+    const request = buildClaudeRequest(systemText, userText, currentModel, options.maxTokens || 4096);
+    const response = await fetchImpl(request.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify(request.body)
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      return extractClaudeOutputText(data).trim();
+    }
+
+    const detail = await response.text();
+    lastError = new Error(`Anthropic HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    // Če model ne obstaja (404), poskusi naslednjega v verigi
+    if (response.status === 404 && detail.includes('not_found_error')) {
+      console.warn(`[claude] model ${currentModel} returned 404, trying fallback model...`);
+      continue;
+    }
+    throw lastError;
+  }
+
+  throw lastError || new Error('Anthropic request failed');
 }
 
 // Združljivostna alias funkcija za Anthropic/Claude

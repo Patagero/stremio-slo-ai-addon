@@ -10,10 +10,12 @@ services:
       - key: PORT
         value: 7002
       - key: ANTHROPIC_MODEL
-        value: claude-3-5-sonnet-20241022
+        value: claude-3-5-sonnet-latest
       - key: PUBLIC_BASE_URL
         sync: false
       - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
         sync: false
       - key: TMDB_API_KEY
         sync: false
