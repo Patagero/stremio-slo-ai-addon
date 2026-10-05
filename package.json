@@ -1,0 +1,13 @@
+{
+  "name": "stremio-slo-ai-addon",
+  "version": "0.6.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {"start":"node index.js","test":"node --test"},
+  "dependencies": {
+    "axios": "^1.7.0",
+    "express": "^4.21.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}

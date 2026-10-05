@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: stremio-slo-ai-addon
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 7002
+      - key: ANTHROPIC_MODEL
+        value: claude-3-5-sonnet-20241022
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TMDB_API_KEY
+        sync: false
+      - key: OPENSUBTITLES_API_KEY
+        sync: false
+      - key: OPENSUBTITLES_USER_AGENT
+        value: SloAIAddon v0.6.0
+      - key: OPENSUBTITLES_USERNAME
+        sync: false
+      - key: OPENSUBTITLES_PASSWORD
+        sync: false
+      - key: TARGET_CPS
+        value: 17
