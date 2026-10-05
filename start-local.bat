@@ -15,7 +15,7 @@ if exist "%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.
 
 set PORT=7002
 set PUBLIC_BASE_URL=http://127.0.0.1:7002
-set ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
+set ANTHROPIC_MODEL=claude-sonnet-5-5
 
 echo [INFO] Strežnik se zaganja na: http://127.0.0.1:7002/manifest.json
 echo [INFO] V Stremio dodajte povezavo: http://127.0.0.1:7002/manifest.json

@@ -15,7 +15,7 @@ test('extractClaudeOutputText reads text from Anthropic response shape (content[
     type: 'message',
     role: 'assistant',
     content: [{ type: 'text', text: 'hello world' }],
-    model: 'claude-3-5-sonnet-20241022'
+    model: 'claude-sonnet-5-5'
   };
   assert.equal(extractClaudeOutputText(realResponse), 'hello world');
 });
@@ -49,9 +49,9 @@ test('buildTranslationSchema adapts to a different count for the shortening pass
 });
 
 test('buildClaudeRequest targets the Anthropic Messages API with model, system, and messages', () => {
-  const request = buildClaudeRequest('System prompt', 'User prompt', 'claude-3-5-sonnet-20241022');
+  const request = buildClaudeRequest('System prompt', 'User prompt', 'claude-sonnet-5-5');
   assert.equal(request.url, 'https://api.anthropic.com/v1/messages');
-  assert.equal(request.body.model, 'claude-3-5-sonnet-20241022');
+  assert.equal(request.body.model, 'claude-sonnet-5-5');
   assert.equal(request.body.system, 'System prompt');
   assert.deepEqual(request.body.messages, [{ role: 'user', content: 'User prompt' }]);
   assert.equal(request.headers['anthropic-version'], '2023-06-01');
@@ -76,7 +76,7 @@ test('translateWithClaude sends x-api-key and reads text from content[] response
   const calls = [];
   const result = await translateWithClaude('system prompt', 'user prompt', {
     apiKey: 'test-key',
-    model: 'claude-3-5-sonnet-20241022',
+    model: 'claude-sonnet-5-5',
     fetchImpl: async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
       return {
@@ -89,7 +89,7 @@ test('translateWithClaude sends x-api-key and reads text from content[] response
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].headers['x-api-key'], 'test-key');
-  assert.equal(calls[0].body.model, 'claude-3-5-sonnet-20241022');
+  assert.equal(calls[0].body.model, 'claude-sonnet-5-5');
   assert.equal(result, '{"translations":[]}');
 });
 

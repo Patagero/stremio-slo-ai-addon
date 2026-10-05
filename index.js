@@ -68,17 +68,16 @@ const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 // Sonnet 5.5 konfiguracija
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || process.env.OPENROUTER_API_KEY || '').trim();
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-5-5';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || ANTHROPIC_MODEL;
 const providerConfig = { name: 'anthropic', model: ANTHROPIC_MODEL };
 
 const CLAUDE_FALLBACK_MODELS = [
   ANTHROPIC_MODEL,
+  'claude-sonnet-5-5',
+  'claude-sonnet-5.5',
   'claude-3-5-sonnet-latest',
-  'claude-3-7-sonnet-latest',
-  'claude-3-5-sonnet-20240620',
-  'claude-3-5-sonnet-20241022',
-  'claude-3-5-haiku-latest'
+  'claude-3-7-sonnet-latest'
 ];
 
 // Ciljna hitrost branja (characters per second). 17 CPS je standardni okvir za odrasle gledalce.
