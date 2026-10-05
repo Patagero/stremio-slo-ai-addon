@@ -32,10 +32,10 @@ test('stremio subtitles endpoint exposes options for HR, ITA, ANG, and Whisper',
   const data = JSON.parse(response.body);
 
   const labels = data.subtitles.map(s => s.label);
-  assert.ok(labels.some(l => l.includes('ANG')));
-  assert.ok(labels.some(l => l.includes('HR')));
-  assert.ok(labels.some(l => l.includes('ITA')));
-  assert.ok(labels.some(l => l.includes('Whisper')));
+  assert.ok(labels.some(l => l.includes('Prevod iz angleščine')));
+  assert.ok(labels.some(l => l.includes('Prevod iz hrvaščine')));
+  assert.ok(labels.some(l => l.includes('Prevod iz italijanščine')));
+  assert.ok(labels.some(l => l.includes('Whisper prevod')));
 
   await new Promise(resolve => server.close(resolve));
 });

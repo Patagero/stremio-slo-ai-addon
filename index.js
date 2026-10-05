@@ -1172,10 +1172,10 @@ function createApp() {
     const videoHash = parseExtraHash(req.params[2]).videoHash;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = {
-      en: 'Prevod iz ANG podnapisov',
-      hr: 'Prevod iz HR podnapisov',
-      it: 'Prevod iz ITA podnapisov',
-      whisper_en: 'Whisper prevod (ANG)'
+      hr: 'Prevod iz hrvaščine',
+      it: 'Prevod iz italijanščine',
+      en: 'Prevod iz angleščine',
+      whisper_en: 'Whisper prevod'
     };
     const extraQuery = [
       videoHash ? `hash=${encodeURIComponent(videoHash)}` : null,
@@ -1187,17 +1187,17 @@ function createApp() {
 
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
-      const label = `Slovenian AI · ${sourceLangLabel[explicitLanguage]}`;
+      const label = sourceLangLabel[explicitLanguage] || 'Slovenski prevod';
       return res.json({ subtitles: [{ id, url: buildUrl(explicitLanguage), lang: 'slv', label }] });
     }
 
     const subtitles = [
-      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir prevoda (ANG/HR/ITA/Whisper) —' },
+      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir (Hrvaščina / Italijanščina / Angleščina / Whisper) —' },
       ...SUPPORTED_SOURCE_LANGUAGES.map(lang => ({
         id: `slo-ai-${type}-${imdbId}-${lang}`,
         url: buildUrl(lang),
         lang: 'slv',
-        label: `Slovenian AI · ${sourceLangLabel[lang]}`
+        label: sourceLangLabel[lang] || 'Slovenski prevod'
       }))
     ];
 
