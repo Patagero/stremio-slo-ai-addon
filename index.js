@@ -66,7 +66,7 @@ const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FI
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
-// Claude (Anthropic Sonnet 3.5 / 3.7) konfiguracija
+// Sonnet 5.5 konfiguracija
 const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '').trim();
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || ANTHROPIC_MODEL;
@@ -89,8 +89,8 @@ const partials = new Map();
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
   version: '0.6.0',
-  name: 'Slo AI Subtitle Translator (Claude Sonnet & Whisper)',
-  description: 'Visokokakovostni slovenski podnapisi iz angleških, hrvaških in italijanskih podnapisov ter Whisper angleškega zvoka (Claude 3.5 Sonnet).',
+  name: 'Slo AI Subtitle Translator (Sonnet 5.5 & Whisper)',
+  description: 'Visokokakovostni slovenski podnapisi iz angleških, hrvaških in italijanskih podnapisov ter Whisper angleškega zvoka (Sonnet 5.5).',
   resources: ['subtitles'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -544,7 +544,7 @@ async function analyzeCharacters(sourceSrt, meta) {
 // ---------- Pass 2: translation ----------
 
 function systemPrompt(context) {
-  return `You are an elite, professional subtitle translator and localizer specializing in English/Croatian/Italian to natural Slovenian translation (powered by Claude 3.5 Sonnet).
+  return `You are an elite, professional subtitle translator and localizer specializing in English/Croatian/Italian to natural Slovenian translation (powered by Sonnet 5.5).
 
 CONTEXT:
 ${context}
@@ -974,7 +974,7 @@ function statusNoticeSrt(text) {
 const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi ANG, HR, ITA ali Whisper spodaj v seznamu.';
 
 function buildPlaceholderSrt() {
-  return statusNoticeSrt('Prevajanje se je začelo (Claude 3.5 Sonnet), prosim počakaj...');
+  return statusNoticeSrt('Prevajanje se je začelo (Sonnet 5.5), prosim počakaj...');
 }
 
 function buildErrorSrt(message) {
@@ -1055,7 +1055,7 @@ function createApp() {
     cacheDir: CACHE_DIR
   }));
 
-  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator (Claude Sonnet & Whisper)</h1><p>Nastavi API ključe v Render Environment Variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
+  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator (Sonnet 5.5 & Whisper)</h1><p>Nastavi API ključe v Render Environment Variables (ANTHROPIC_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
 
   function startTranslationJob(imdbId, key, sourceLanguage, videoHash, strict, season, episode) {
     if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;

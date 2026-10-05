@@ -1,7 +1,7 @@
 @echo off
-title Slo AI Stremio Addon (Claude Sonnet + Whisper Local)
+title Slo AI Stremio Addon (Sonnet 5.5 + Whisper Local)
 echo ========================================================
-echo  Zagon Slo AI Stremio Addona (Lokalni Whisper + Claude Sonnet)
+echo  Zagon Slo AI Stremio Addona (Lokalni Whisper + Sonnet 5.5)
 echo ========================================================
 cd /d "%~dp0"
 
