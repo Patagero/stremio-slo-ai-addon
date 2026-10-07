@@ -368,11 +368,26 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash,
 
 async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
+
+  const req = String(requestedLanguage || '').toLowerCase();
+  
+  // Če je samodejna izbira (auto), najprej preverimo, ali že obstajajo originalni slovenski podnapisi
+  if (req === 'auto' || !req) {
+    try {
+      const sloveneFound = await fetchOpenSubtitleForLanguage(imdbId, 'sl', videoHash, season, episode);
+      if (sloveneFound) {
+        return { ...sloveneFound, isNativeSlovene: true };
+      }
+    } catch (error) {
+      console.warn(`[opensubtitles] preverjanje obstoječih slovenskih podnapisov (${imdbId}) ni uspelo: ${error.message}`);
+    }
+  }
+
   const languages = resolveSourceLanguages(meta, requestedLanguage, strict);
   for (const language of languages) {
     try {
       const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode);
-      if (found) return found;
+      if (found) return { ...found, isNativeSlovene: false };
     } catch (error) {
       console.warn(`[opensubtitles] ${imdbId} (${language}) failed: ${error.message}`);
     }
@@ -710,11 +725,22 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
-    const { srt: rawSource, language: usedLanguage, fileName: sourceFileName, matchedByHash } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode);
+    const { srt: rawSource, language: usedLanguage, fileName: sourceFileName, matchedByHash, isNativeSlovene } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode);
+
+    // Če že obstajajo originalni slovenski podnapisi, jih le očistimo (SDH) in postrežemo brez AI prevajanja
+    if (isNativeSlovene) {
+      console.log(`[Subtitles] Najdeni obstoječi slovenski podnapisi na internetu (${sourceFileName || `${imdbId}.sl.srt`}) - AI prevajanje ni potrebno.`);
+      const cleanedSlovene = removeSdh(rawSource);
+      const entry = { srt: cleanedSlovene, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+      cache.set(key, entry);
+      saveCacheEntryToDisk(key, entry);
+      saveSlovenianSrtFile(imdbId, season, episode, cleanedSlovene);
+      return cleanedSlovene;
+    }
 
     // 1. Izpis izbranega jezika in datoteke
     const langLabel = LANGUAGE_DISPLAY_NAMES[usedLanguage] || usedLanguage.toUpperCase();
-    const sourceNotice = `[Subtitles] Izbran jezik za prevod: ${langLabel} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`;
+    const sourceNotice = `[Subtitles] Slovenski podnapisi ne obstajajo. Izbran jezik za prevod: ${langLabel} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`;
     console.log(`[translation] ${sourceNotice}`);
 
     if (!matchedByHash) {
