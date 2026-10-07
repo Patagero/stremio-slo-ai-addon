@@ -722,7 +722,17 @@ function parseExtraHash(extra) {
 async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, season, episode) {
   const key = buildCacheKey(imdbId, sourceLanguage, videoHash, season, episode);
   const cached = cache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.srt;
+  if (cached && cached.expiresAt > Date.now()) {
+    const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
+    console.log(`[Subtitles] ${notice} (${imdbId})`);
+    return prependNoticeCue(cached.srt, notice);
+  }
+  const localDiskSrt = loadSlovenianSrtFile(imdbId, season, episode);
+  if (localDiskSrt) {
+    const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
+    console.log(`[Subtitles] ${notice} (${imdbId})`);
+    return prependNoticeCue(localDiskSrt, notice);
+  }
   if (inflight.has(key)) return inflight.get(key);
 
   const job = (async () => {
@@ -749,11 +759,12 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
       const genericKey = buildCacheKey(imdbId, usedLanguage, null, season, episode);
       const genericCached = cache.get(genericKey);
       if (genericCached && genericCached.expiresAt > Date.now()) {
-        console.log(`[translation] ${imdbId}: reusing existing translation for this release`);
+        const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
+        console.log(`[Subtitles] ${notice} (${imdbId}): reusing existing translation`);
         cache.set(key, genericCached);
         saveCacheEntryToDisk(key, genericCached);
         saveSlovenianSrtFile(imdbId, season, episode, genericCached.srt);
-        return genericCached.srt;
+        return prependNoticeCue(genericCached.srt, notice);
       }
     }
 
@@ -899,6 +910,18 @@ function saveSlovenianSrtFile(imdbId, season, episode, srtContent) {
     console.warn(`[storage] failed to save .sl.srt file: ${err.message}`);
     return null;
   }
+}
+
+function loadSlovenianSrtFile(imdbId, season, episode) {
+  try {
+    const epSuffix = season && episode ? `_s${season}e${episode}` : '';
+    const safeName = `${String(imdbId).replace(/[^a-z0-9_-]/gi, '_')}${epSuffix}.sl.srt`;
+    const filePath = path.join(CACHE_DIR, safeName);
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath, 'utf8');
+    }
+  } catch (_) {}
+  return null;
 }
 
 function cacheFilePath(key) {
@@ -1119,7 +1142,13 @@ function createApp() {
 
     const finalEntry = cache.get(key);
     if (finalEntry && finalEntry.expiresAt > Date.now()) {
-      return res.type('application/x-subrip; charset=utf-8').send(finalEntry.srt);
+      const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
+      return res.type('application/x-subrip; charset=utf-8').send(prependNoticeCue(finalEntry.srt, notice));
+    }
+    const localDiskSrt = loadSlovenianSrtFile(imdbId, season, episode);
+    if (localDiskSrt) {
+      const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
+      return res.type('application/x-subrip; charset=utf-8').send(prependNoticeCue(localDiskSrt, notice));
     }
 
     // Zaženemo prevod / iskanje slovenskih podnapisov
