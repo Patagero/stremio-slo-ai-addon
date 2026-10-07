@@ -1118,7 +1118,8 @@ function createApp() {
 
     // Zaženemo prevod / iskanje slovenskih podnapisov
     try {
-      const translationPromise = translateSubtitle(imdbId, lang, videoHash, lang !== 'auto', season, episode);
+      // strict = false omogoča samodejni prehod na naslednje jezike po prioriteti (HR -> IT -> EN)
+      const translationPromise = translateSubtitle(imdbId, lang, videoHash, false, season, episode);
       
       // Če najde slovenske podnapise na OpenSubtitles, se zaključi takoj (v 1-2s).
       // Počakamo do 8 sekund, preden bi morda vrnili delno obvestilo.
