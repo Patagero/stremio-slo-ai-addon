@@ -66,7 +66,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.0',
+  version: '0.7.1',
   name: 'Slo AI Subtitle Translator (Gemini 3.1 Pro)',
   description: 'Vrhunski slovenski podnapisi z Gemini 3.1 Pro: samodejna izbira vira (HR -> IT -> EN), natančno SDH čiščenje in spolno ujemanje (on/ona).',
   resources: ['subtitles'],
@@ -1096,7 +1096,7 @@ function createApp() {
       });
   }
 
-  app.get('/subtitle-file/:imdbId/:lang.srt', (req, res) => {
+  app.get('/subtitle-file/:imdbId/:lang.srt', async (req, res) => {
     const { imdbId } = req.params;
     const lang = req.params.lang;
     const videoHash = req.query.hash ? String(req.query.hash) : null;
@@ -1109,11 +1109,29 @@ function createApp() {
     if (!SUPPORTED_SOURCE_LANGUAGES.includes(lang)) return res.sendStatus(404);
 
     const key = buildCacheKey(imdbId, lang, videoHash, season, episode);
-    startTranslationJob(imdbId, key, lang, videoHash, lang !== 'auto', season, episode);
 
     const finalEntry = cache.get(key);
     if (finalEntry && finalEntry.expiresAt > Date.now()) {
       return res.type('application/x-subrip; charset=utf-8').send(finalEntry.srt);
+    }
+
+    // Zaženemo prevod / iskanje slovenskih podnapisov
+    try {
+      const translationPromise = translateSubtitle(imdbId, lang, videoHash, lang !== 'auto', season, episode);
+      
+      // Če najde slovenske podnapise na OpenSubtitles, se zaključi takoj (v 1-2s).
+      // Počakamo do 8 sekund, preden bi morda vrnili delno obvestilo.
+      const immediateResult = await Promise.race([
+        translationPromise,
+        new Promise(resolve => setTimeout(() => resolve(null), 8000))
+      ]);
+
+      if (immediateResult) {
+        return res.type('application/x-subrip; charset=utf-8').send(immediateResult);
+      }
+    } catch (error) {
+      console.error(`[translation] ${imdbId}: ${error.message}`);
+      return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message));
     }
 
     const partial = partials.get(key);
