@@ -4,6 +4,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
+// Samodejno nalaganje .env datoteke, če obstaja
+try {
+  const envPath = path.join(__dirname, '.env');
+  if (fs.existsSync(envPath)) {
+    const envLines = fs.readFileSync(envPath, 'utf8').split('\n');
+    for (const line of envLines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx > 0) {
+        const k = trimmed.slice(0, eqIdx).trim();
+        const v = trimmed.slice(eqIdx + 1).trim().replace(/^["'](.*)["']$/, '$1');
+        if (!process.env[k] && v) process.env[k] = v;
+      }
+    }
+  }
+} catch (_) {}
+
 function secondsToTimecode(sec) {
   const totalMs = Math.round(sec * 1000);
   const hours = Math.floor(totalMs / 3600000);
