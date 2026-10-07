@@ -1,43 +1,46 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { systemPrompt, translateWithClaude, validateSlovenianSubtitle } = require('../index');
+const { systemPrompt, translateWithGemini, validateSlovenianSubtitle } = require('../index');
 
 test('full Slovenian prompt contains all requested quality rules', () => {
   const prompt = systemPrompt('Title: Demo\nPlot: Story\nTMDB Cast Genders:\nAna: Female\n\nCHARACTER LEDGER (from dialogue analysis):\nAna: female [confidence: high]');
   for (const phrase of [
-    'READING SPEED & LENGTH CONTROL',
-    'characters per second',
+    'SPOLNO UJEMANJE',
     'CHARACTER LEDGER',
-    'GENDER & CONTEXT ACCURACY',
-    'Never infer gender from voice alone',
     'rekla sem',
     'rekel sem',
+    'OMEJITEV VRSTIC',
     'tikanje',
     'vikanje',
-    'PERFECT SRT SYNTAX',
-    'Output ONLY'
+    'POPOLNA TEHNIČNA INTEGRITETA',
+    'translations'
   ]) assert.match(prompt, new RegExp(phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
 });
 
-test('Claude provider is used and receives the current SRT chunk', async () => {
+test('Gemini provider is used and receives the current SRT chunk', async () => {
   const calls = [];
-  const result = await translateWithClaude('SYSTEM', 'Hello', {
+  const result = await translateWithGemini('SYSTEM', 'Hello', {
     apiKey: 'test-key',
     fetchImpl: async (url, options) => {
       calls.push({ url, options, body: JSON.parse(options.body) });
       return {
         ok: true,
         json: async () => ({
-          content: [{ type: 'text', text: '{"translations":[{"id":"1","text":"Živjo"}]}' }]
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '{"translations":[{"id":"1","text":"Živjo"}]}' }]
+              }
+            }
+          ]
         })
       };
     }
   });
   assert.equal(result.includes('Živjo'), true);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, 'https://api.anthropic.com/v1/messages');
-  assert.equal(calls[0].body.messages[0].content, 'Hello');
-  assert.equal(calls[0].options.headers['x-api-key'], 'test-key');
+  assert.ok(calls[0].url.includes('generateContent'));
+  assert.ok(calls[0].url.includes('key=test-key'));
 });
 
 test('subtitle validator enforces at most two lines and the configured character limit', () => {

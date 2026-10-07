@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 >nul
-title Slo AI Stremio Addon (Sonnet 5.5 + Whisper Local)
+title Slo AI Stremio Addon (Gemini 3.1 Pro + Whisper)
 
 echo ========================================================
-echo  Zagon Slo AI Stremio Addona (Lokalni Whisper + Sonnet 5.5)
+echo  Zagon Slo AI Stremio Addona (Gemini 3.1 Pro + Whisper)
 echo ========================================================
 
 cd /d "%~dp0"
@@ -15,7 +15,7 @@ if exist "%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.
 
 set PORT=7002
 set PUBLIC_BASE_URL=http://127.0.0.1:7002
-set ANTHROPIC_MODEL=claude-sonnet-5-5
+set GEMINI_MODEL=gemini-3.1-pro-preview
 
 echo [INFO] Strežnik se zaganja na: http://127.0.0.1:7002/manifest.json
 echo [INFO] V Stremio dodajte povezavo: http://127.0.0.1:7002/manifest.json

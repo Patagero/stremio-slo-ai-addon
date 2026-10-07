@@ -14,8 +14,8 @@ function get(server, path) {
   });
 }
 
-test('supported source languages include en, hr, it, and whisper_en', () => {
-  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['en', 'hr', 'it', 'whisper_en']);
+test('supported source languages include auto, hr, it, en, and whisper_en', () => {
+  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['auto', 'hr', 'it', 'en', 'whisper_en']);
 });
 
 test('resolveSourceLanguages handles whisper_en explicitly', () => {

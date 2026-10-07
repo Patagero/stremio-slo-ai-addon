@@ -9,23 +9,23 @@ services:
     envVars:
       - key: PORT
         value: 7002
-      - key: ANTHROPIC_MODEL
-        value: claude-sonnet-5-5
+      - key: GEMINI_MODEL
+        value: gemini-3.1-pro-preview
+      - key: GEMINI_API_KEY
+        sync: false
       - key: PUBLIC_BASE_URL
-        sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
         sync: false
       - key: TMDB_API_KEY
         sync: false
       - key: OPENSUBTITLES_API_KEY
         sync: false
       - key: OPENSUBTITLES_USER_AGENT
-        value: SloAIAddon v0.6.0
+        value: SloAIAddon v0.7.0
       - key: OPENSUBTITLES_USERNAME
         sync: false
       - key: OPENSUBTITLES_PASSWORD
         sync: false
       - key: TARGET_CPS
         value: 17
+      - key: MAX_LINE_CHARS
+        value: 42

@@ -16,7 +16,7 @@ test('character analysis prompt asks for a structured gender ledger', () => {
   const prompt = characterAnalysisPrompt('Title: Demo');
   assert.match(prompt, /character-gender reference sheet/i);
   assert.match(prompt, /"gender":"male\|female\|unknown"/);
-  assert.match(prompt, /Croatian and Italian mark gender directly on past-tense verbs/i);
+  assert.match(prompt, /Croatian and Italian explicitly mark feminine past tense verbs/i);
 });
 
 test('parses a valid character ledger JSON response', () => {
@@ -45,10 +45,10 @@ test('analyzeCharacters falls back gracefully when Claude is not configured', as
   assert.deepEqual(characters, []);
 });
 
-test('source language priority is fixed EN -> HR -> IT, with an explicit request taking priority', () => {
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, 'hr'), ['hr', 'en', 'it']);
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, null), ['en', 'hr', 'it']);
-  assert.deepEqual(resolveSourceLanguages({ originalLanguage: null }, null), ['en', 'hr', 'it']);
+test('source language priority is fixed HR -> IT -> EN, with an explicit request taking priority', () => {
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'en' }, 'hr'), ['hr', 'it', 'en']);
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: 'it' }, null), ['hr', 'it', 'en']);
+  assert.deepEqual(resolveSourceLanguages({ originalLanguage: null }, null), ['hr', 'it', 'en']);
 });
 
 test('strict mode returns only the explicitly requested language, with no fallback', () => {
@@ -57,8 +57,8 @@ test('strict mode returns only the explicitly requested language, with no fallba
 });
 
 test('strict mode with no valid requested language still falls back to the full default order', () => {
-  assert.deepEqual(resolveSourceLanguages({}, null, true), ['en', 'hr', 'it']);
-  assert.deepEqual(resolveSourceLanguages({}, 'xx', true), ['en', 'hr', 'it']);
+  assert.deepEqual(resolveSourceLanguages({}, null, true), ['hr', 'it', 'en']);
+  assert.deepEqual(resolveSourceLanguages({}, 'xx', true), ['hr', 'it', 'en']);
 });
 
 test('cue duration is computed from the SRT timecode', () => {

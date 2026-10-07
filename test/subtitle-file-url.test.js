@@ -37,9 +37,9 @@ test('the /subtitles response builds direct, self-describing URLs (no random tok
   const response = await get(server, '/subtitles/movie/tt1234567.json');
   assert.equal(response.statusCode, 200);
   const data = JSON.parse(response.body);
-  assert.equal(data.subtitles.length, 5); // choose + en + hr + it + whisper_en
+  assert.equal(data.subtitles.length, 6); // choose + auto + hr + it + en + whisper_en
   for (const sub of data.subtitles) {
-    assert.match(sub.url, /\/subtitle-file\/tt1234567\/(choose|en|hr|it|whisper_en)\.srt$/);
+    assert.match(sub.url, /\/subtitle-file\/tt1234567\/(choose|auto|en|hr|it|whisper_en)\.srt$/);
   }
 
   await new Promise(resolve => server.close(resolve));
@@ -52,11 +52,11 @@ test('a series id (tt1234567:season:episode) is split correctly: clean imdbId in
   const response = await get(server, '/subtitles/series/tt1234567:2:5.json');
   assert.equal(response.statusCode, 200);
   const data = JSON.parse(response.body);
-  assert.equal(data.subtitles.length, 5); // choose + en + hr + it + whisper_en
+  assert.equal(data.subtitles.length, 6); // choose + auto + hr + it + en + whisper_en
   for (const sub of data.subtitles) {
     // The base id in the URL PATH must be the clean "tt1234567" — NOT the raw
     // "tt1234567:2:5" string, which is what broke OpenSubtitles/TMDB lookups before.
-    assert.match(sub.url, /^https?:\/\/[^/]+\/subtitle-file\/tt1234567\/(choose|en|hr|it|whisper_en)\.srt\?season=2&episode=5$/);
+    assert.match(sub.url, /^https?:\/\/[^/]+\/subtitle-file\/tt1234567\/(choose|auto|en|hr|it|whisper_en)\.srt\?season=2&episode=5$/);
   }
 
   await new Promise(resolve => server.close(resolve));
