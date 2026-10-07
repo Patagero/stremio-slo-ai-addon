@@ -778,6 +778,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
       && savedPartial.order.every((id, i) => id === sourceIds[i]);
 
     const partial = resumable ? savedPartial : createPartialTracker(sourceEntries, chunks.length);
+    partial.sourceNotice = sourceNotice;
     partials.set(key, partial);
 
     await runWithConcurrency(chunks, TRANSLATION_CONCURRENCY, async chunk => {
@@ -992,14 +993,14 @@ function friendlyErrorMessage(raw) {
 }
 
 function statusNoticeSrt(text) {
-  return `0\n00:00:00,000 --> 00:00:04,000\n[Slo AI prevod] ${text}`;
+  return `0\n00:00:01,000 --> 00:00:05,000\n${text}`;
 }
 
-const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi ANG, HR ali ITA spodaj v seznamu.';
+const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:01,000 --> 09:59:59,000\n[Slo AI prevod] Izberi vir spodaj v seznamu.';
 
-function buildPlaceholderSrt(lang = 'auto') {
-  const langName = LANGUAGE_DISPLAY_NAMES[lang] || 'izbranega vira';
-  return statusNoticeSrt(`Prevajanje se je začelo z Gemini 3.1 Pro (${langName}), prosim počakaj...`);
+function buildPlaceholderSrt(lang = 'hr') {
+  const langName = LANGUAGE_DISPLAY_NAMES[lang] || lang.toUpperCase();
+  return statusNoticeSrt(`[Subtitles] Slovenski podnapisi ne obstajajo. Prevod iz: ${langName}`);
 }
 
 function buildErrorSrt(message) {
@@ -1137,14 +1138,8 @@ function createApp() {
     const partial = partials.get(key);
     if (partial) {
       const body = partialToSrt(partial);
-      const done = partial.doneChunkIndices.size;
-      let notice = null;
-      if (done === 0) {
-        notice = statusNoticeSrt('Prevajanje z Gemini 3.1 Pro se je začelo, prvi del bo kmalu na voljo...');
-      } else if (done < partial.totalChunks) {
-        notice = statusNoticeSrt(`Prvi del je preveden (${done}/${partial.totalChunks}), preostanek se prevaja v ozadju.`);
-      }
-      const combined = notice ? `${notice}\n\n${body}` : body;
+      const notice = partial.sourceNotice || buildPlaceholderSrt(lang);
+      const combined = prependNoticeCue(body, notice);
       return res.type('application/x-subrip; charset=utf-8').send(combined);
     }
 
