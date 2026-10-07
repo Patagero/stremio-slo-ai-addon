@@ -731,8 +731,8 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
     // Če že obstajajo originalni slovenski podnapisi, jih le očistimo (SDH) in postrežemo brez AI prevajanja
     if (isNativeSlovene) {
-      const sloveneNotice = `[Subtitles] Najdeni obstoječi slovenski podnapisi na internetu (${sourceFileName || `${imdbId}.sl.srt`}) - AI prevajanje ni potrebno.`;
-      console.log(sloveneNotice);
+      const sloveneNotice = 'Najdeni slovenski podnapisi-prevod ni potreben.';
+      console.log(`[Subtitles] ${sloveneNotice} (${sourceFileName || `${imdbId}.sl.srt`})`);
       const cleanedSlovene = prependNoticeCue(removeSdh(rawSource), sloveneNotice);
       const entry = { srt: cleanedSlovene, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
       cache.set(key, entry);
@@ -742,9 +742,8 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     }
 
     // 1. Izpis izbranega jezika in datoteke
-    const langLabel = LANGUAGE_DISPLAY_NAMES[usedLanguage] || usedLanguage.toUpperCase();
-    const sourceNotice = `[Subtitles] Slovenski podnapisi ne obstajajo. Prevod iz: ${langLabel} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`;
-    console.log(`[translation] ${sourceNotice}`);
+    const sourceNotice = getTranslationNotice(usedLanguage);
+    console.log(`[Subtitles] ${sourceNotice} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`);
 
     if (!matchedByHash) {
       const genericKey = buildCacheKey(imdbId, usedLanguage, null, season, episode);
@@ -998,9 +997,16 @@ function statusNoticeSrt(text) {
 
 const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:01,000 --> 09:59:59,000\n[Slo AI prevod] Izberi vir spodaj v seznamu.';
 
+function getTranslationNotice(lang) {
+  if (lang === 'hr') return 'Prevod iz hrvaških podnapisov.';
+  if (lang === 'it') return 'Prevod iz italijanskih podnapisov.';
+  if (lang === 'en') return 'Prevod iz angleških podnapisov.';
+  const name = LANGUAGE_DISPLAY_NAMES[lang] || lang.toUpperCase();
+  return `Prevod iz ${name} podnapisov.`;
+}
+
 function buildPlaceholderSrt(lang = 'hr') {
-  const langName = LANGUAGE_DISPLAY_NAMES[lang] || lang.toUpperCase();
-  return statusNoticeSrt(`[Subtitles] Slovenski podnapisi ne obstajajo. Prevod iz: ${langName}`);
+  return statusNoticeSrt(getTranslationNotice(lang));
 }
 
 function buildErrorSrt(message) {

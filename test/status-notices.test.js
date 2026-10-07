@@ -28,5 +28,5 @@ test('buildErrorSrt wraps the friendly message as a visible status cue', () => {
 });
 
 test('buildPlaceholderSrt announces that translation has started', () => {
-  assert.match(buildPlaceholderSrt(), /Slovenski podnapisi ne obstajajo\. Prevod iz:/i);
+  assert.match(buildPlaceholderSrt(), /Prevod iz hrvaških podnapisov\./i);
 });
