@@ -14,8 +14,8 @@ function get(server, path) {
   });
 }
 
-test('supported source languages include auto, hr, it, and en', () => {
-  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['auto', 'hr', 'it', 'en']);
+test('supported source languages include hr, it, and en', () => {
+  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['hr', 'it', 'en']);
 });
 
 test('resolveSourceLanguages handles hr explicitly', () => {
@@ -23,7 +23,7 @@ test('resolveSourceLanguages handles hr explicitly', () => {
   assert.deepEqual(resolved, ['hr']);
 });
 
-test('stremio subtitles endpoint exposes options for HR, ITA, and ANG', async () => {
+test('stremio subtitles endpoint exposes options for HR, IT, and ANG', async () => {
   const server = createApp().listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
 
@@ -32,9 +32,10 @@ test('stremio subtitles endpoint exposes options for HR, ITA, and ANG', async ()
   const data = JSON.parse(response.body);
 
   const labels = data.subtitles.map(s => s.label);
-  assert.ok(labels.some(l => l.includes('Prevod iz angleščine')));
-  assert.ok(labels.some(l => l.includes('Prevod iz hrvaščine')));
-  assert.ok(labels.some(l => l.includes('Prevod iz italijanščine')));
+  assert.equal(labels.length, 3);
+  assert.ok(labels.includes('Prevod iz HR'));
+  assert.ok(labels.includes('Prevod iz IT'));
+  assert.ok(labels.includes('Prevod iz ANG'));
 
   await new Promise(resolve => server.close(resolve));
 });

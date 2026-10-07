@@ -50,7 +50,7 @@ const MAX_LINES = 2;
 
 // 1. AVTOMATSKA IZBIRA VIRA (Prioriteta: 1. Hrvaški, 2. Italijanski, 3. Angleški)
 const DEFAULT_LANGUAGE_PRIORITY = ['hr', 'it', 'en'];
-const SUPPORTED_SOURCE_LANGUAGES = ['auto', 'hr', 'it', 'en'];
+const SUPPORTED_SOURCE_LANGUAGES = ['hr', 'it', 'en'];
 
 const LANGUAGE_DISPLAY_NAMES = {
   hr: 'HRVAŠČINA',
@@ -366,21 +366,23 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash,
   return { srt, language, fileName, matchedByHash: false };
 }
 
+function prependNoticeCue(srtText, noticeMessage) {
+  const noticeCue = `0\n00:00:01,000 --> 00:00:05,000\n${noticeMessage}\n\n`;
+  const cleanBody = String(srtText || '').replace(/^0\r?\n00:00:0[^\n]*\r?\n[^\n]*\r?\n\r?\n?/, '');
+  return `${noticeCue}${cleanBody.trimStart()}`;
+}
+
 async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
 
-  const req = String(requestedLanguage || '').toLowerCase();
-  
-  // Če je samodejna izbira (auto), najprej preverimo, ali že obstajajo originalni slovenski podnapisi
-  if (req === 'auto' || !req) {
-    try {
-      const sloveneFound = await fetchOpenSubtitleForLanguage(imdbId, 'sl', videoHash, season, episode);
-      if (sloveneFound) {
-        return { ...sloveneFound, isNativeSlovene: true };
-      }
-    } catch (error) {
-      console.warn(`[opensubtitles] preverjanje obstoječih slovenskih podnapisov (${imdbId}) ni uspelo: ${error.message}`);
+  // Vedno najprej preverimo, ali že obstajajo originalni slovenski podnapisi na internetu
+  try {
+    const sloveneFound = await fetchOpenSubtitleForLanguage(imdbId, 'sl', videoHash, season, episode);
+    if (sloveneFound) {
+      return { ...sloveneFound, isNativeSlovene: true };
     }
+  } catch (error) {
+    console.warn(`[opensubtitles] preverjanje obstoječih slovenskih podnapisov (${imdbId}) ni uspelo: ${error.message}`);
   }
 
   const languages = resolveSourceLanguages(meta, requestedLanguage, strict);
@@ -729,8 +731,9 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
     // Če že obstajajo originalni slovenski podnapisi, jih le očistimo (SDH) in postrežemo brez AI prevajanja
     if (isNativeSlovene) {
-      console.log(`[Subtitles] Najdeni obstoječi slovenski podnapisi na internetu (${sourceFileName || `${imdbId}.sl.srt`}) - AI prevajanje ni potrebno.`);
-      const cleanedSlovene = removeSdh(rawSource);
+      const sloveneNotice = `[Subtitles] Najdeni obstoječi slovenski podnapisi na internetu (${sourceFileName || `${imdbId}.sl.srt`}) - AI prevajanje ni potrebno.`;
+      console.log(sloveneNotice);
+      const cleanedSlovene = prependNoticeCue(removeSdh(rawSource), sloveneNotice);
       const entry = { srt: cleanedSlovene, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
       cache.set(key, entry);
       saveCacheEntryToDisk(key, entry);
@@ -740,7 +743,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
     // 1. Izpis izbranega jezika in datoteke
     const langLabel = LANGUAGE_DISPLAY_NAMES[usedLanguage] || usedLanguage.toUpperCase();
-    const sourceNotice = `[Subtitles] Slovenski podnapisi ne obstajajo. Izbran jezik za prevod: ${langLabel} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`;
+    const sourceNotice = `[Subtitles] Slovenski podnapisi ne obstajajo. Prevod iz: ${langLabel} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`;
     console.log(`[translation] ${sourceNotice}`);
 
     if (!matchedByHash) {
@@ -807,21 +810,22 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     const srt = partialToSrt(partial);
     const validated = reconcileTranslatedSrt(source, srt);
     parseAndValidateSrt(source, validated);
+    const finalSrtWithNotice = prependNoticeCue(validated, sourceNotice);
 
     // 4. Shranjevanje v predpomnilnik in novo .sl.srt datoteko
-    cache.set(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
-    saveCacheEntryToDisk(key, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
-    saveSlovenianSrtFile(imdbId, season, episode, validated);
+    cache.set(key, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
+    saveCacheEntryToDisk(key, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
+    saveSlovenianSrtFile(imdbId, season, episode, finalSrtWithNotice);
 
     if (!matchedByHash) {
       const genericKey = buildCacheKey(imdbId, usedLanguage, null);
-      cache.set(genericKey, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
-      saveCacheEntryToDisk(genericKey, { srt: validated, expiresAt: Date.now() + CACHE_TTL_MS });
+      cache.set(genericKey, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
+      saveCacheEntryToDisk(genericKey, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
     }
     deletePartialFromDisk(key);
     partials.delete(key);
-    console.log(`[translation] ${imdbId}: successfully translated and saved ${parseSrt(validated).length} cues to .sl.srt`);
-    return validated;
+    console.log(`[translation] ${imdbId}: successfully translated and saved ${parseSrt(finalSrtWithNotice).length} cues to .sl.srt`);
+    return finalSrtWithNotice;
   })();
 
   inflight.set(key, job);
@@ -1143,10 +1147,9 @@ function createApp() {
     const videoHash = parseExtraHash(req.params[2]).videoHash;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
     const sourceLangLabel = {
-      auto: 'Avtomatska izbira (HR -> IT -> EN)',
-      hr: 'Prevod iz hrvaščine',
-      it: 'Prevod iz italijanščine',
-      en: 'Prevod iz angleščine'
+      hr: 'Prevod iz HR',
+      it: 'Prevod iz IT',
+      en: 'Prevod iz ANG'
     };
     const extraQuery = [
       videoHash ? `hash=${encodeURIComponent(videoHash)}` : null,
@@ -1158,15 +1161,14 @@ function createApp() {
 
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
-      const label = sourceLangLabel[explicitLanguage] || 'Slovenski prevod';
+      const label = sourceLangLabel[explicitLanguage] || `Prevod iz ${explicitLanguage.toUpperCase()}`;
       return res.json({ subtitles: [{ id, url: buildUrl(explicitLanguage), lang: 'slv', label }] });
     }
 
     const subtitles = [
-      { id: `slo-ai-${type}-${imdbId}-auto`, url: buildUrl('auto'), lang: 'slv', label: 'Slovenski AI prevod (Auto: HR -> IT -> EN)' },
-      { id: `slo-ai-${type}-${imdbId}-hr`, url: buildUrl('hr'), lang: 'slv', label: 'Prevod iz hrvaščine' },
-      { id: `slo-ai-${type}-${imdbId}-it`, url: buildUrl('it'), lang: 'slv', label: 'Prevod iz italijanščine' },
-      { id: `slo-ai-${type}-${imdbId}-en`, url: buildUrl('en'), lang: 'slv', label: 'Prevod iz angleščine' }
+      { id: `slo-ai-${type}-${imdbId}-hr`, url: buildUrl('hr'), lang: 'slv', label: 'Prevod iz HR' },
+      { id: `slo-ai-${type}-${imdbId}-it`, url: buildUrl('it'), lang: 'slv', label: 'Prevod iz IT' },
+      { id: `slo-ai-${type}-${imdbId}-en`, url: buildUrl('en'), lang: 'slv', label: 'Prevod iz ANG' }
     ];
 
     return res.json({ subtitles });
