@@ -14,16 +14,16 @@ function get(server, path) {
   });
 }
 
-test('supported source languages include auto, hr, it, en, and whisper_en', () => {
-  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['auto', 'hr', 'it', 'en', 'whisper_en']);
+test('supported source languages include auto, hr, it, and en', () => {
+  assert.deepEqual(SUPPORTED_SOURCE_LANGUAGES, ['auto', 'hr', 'it', 'en']);
 });
 
-test('resolveSourceLanguages handles whisper_en explicitly', () => {
-  const resolved = resolveSourceLanguages({}, 'whisper_en', true);
-  assert.deepEqual(resolved, ['whisper_en']);
+test('resolveSourceLanguages handles hr explicitly', () => {
+  const resolved = resolveSourceLanguages({}, 'hr', true);
+  assert.deepEqual(resolved, ['hr']);
 });
 
-test('stremio subtitles endpoint exposes options for HR, ITA, ANG, and Whisper', async () => {
+test('stremio subtitles endpoint exposes options for HR, ITA, and ANG', async () => {
   const server = createApp().listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
 
@@ -35,7 +35,6 @@ test('stremio subtitles endpoint exposes options for HR, ITA, ANG, and Whisper',
   assert.ok(labels.some(l => l.includes('Prevod iz angleščine')));
   assert.ok(labels.some(l => l.includes('Prevod iz hrvaščine')));
   assert.ok(labels.some(l => l.includes('Prevod iz italijanščine')));
-  assert.ok(labels.some(l => l.includes('Whisper prevod')));
 
   await new Promise(resolve => server.close(resolve));
 });

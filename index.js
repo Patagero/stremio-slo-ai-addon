@@ -2,9 +2,8 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 
-// Samodejno nalaganje .env datoteke, če obstaja
+// Samodejno nalaganje .env datoteke, če obstaja (za razvoj)
 try {
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
@@ -22,61 +21,6 @@ try {
   }
 } catch (_) {}
 
-function secondsToTimecode(sec) {
-  const totalMs = Math.round(sec * 1000);
-  const hours = Math.floor(totalMs / 3600000);
-  const minutes = Math.floor((totalMs % 3600000) / 60000);
-  const seconds = Math.floor((totalMs % 60000) / 1000);
-  const ms = totalMs % 1000;
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
-}
-
-async function runLocalWhisperExtraction(streamUrl, startSec = 0, durationSec = 120, modelSize = 'small') {
-  return new Promise((resolve) => {
-    const pythonScript = path.join(__dirname, 'whisper-engine.py');
-    const pyProc = spawn('python', [
-      pythonScript,
-      '--url', streamUrl,
-      '--start', String(startSec),
-      '--duration', String(durationSec),
-      '--model', modelSize
-    ]);
-
-    let stdout = '';
-    let stderr = '';
-    pyProc.stdout.on('data', data => { stdout += data; });
-    pyProc.stderr.on('data', data => { stderr += data; });
-
-    pyProc.on('close', code => {
-      if (code !== 0) {
-        console.warn(`[whisper-local] failed with code ${code}: ${stderr}`);
-        return resolve(null);
-      }
-      try {
-        const parsed = JSON.parse(stdout);
-        if (parsed.error || !Array.isArray(parsed.cues) || !parsed.cues.length) {
-          console.warn(`[whisper-local] returned error or no cues: ${parsed.error || '0 cues'}`);
-          return resolve(null);
-        }
-        const entries = parsed.cues.map((c, i) => ({
-          id: String(i + 1),
-          timecode: `${secondsToTimecode(c.start)} --> ${secondsToTimecode(c.end)}`,
-          text: c.text
-        }));
-        return resolve(toSrt(entries));
-      } catch (err) {
-        console.warn(`[whisper-local] JSON parse error: ${err.message}`);
-        return resolve(null);
-      }
-    });
-
-    pyProc.on('error', err => {
-      console.warn(`[whisper-local] spawn error: ${err.message}`);
-      return resolve(null);
-    });
-  });
-}
-
 const PORT = Number(process.env.PORT || 7002);
 const CHUNK_SIZE = Math.max(30, Math.min(50, Number(process.env.CHUNK_SIZE || 40)));
 const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.TRANSLATION_CONCURRENCY || 2)));
@@ -84,7 +28,7 @@ const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FI
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
-// Gemini 3.1 Pro konfiguracija
+// Google Gemini 3.1 Pro konfiguracija
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || GEMINI_MODEL;
@@ -106,13 +50,12 @@ const MAX_LINES = 2;
 
 // 1. AVTOMATSKA IZBIRA VIRA (Prioriteta: 1. Hrvaški, 2. Italijanski, 3. Angleški)
 const DEFAULT_LANGUAGE_PRIORITY = ['hr', 'it', 'en'];
-const SUPPORTED_SOURCE_LANGUAGES = ['auto', 'hr', 'it', 'en', 'whisper_en'];
+const SUPPORTED_SOURCE_LANGUAGES = ['auto', 'hr', 'it', 'en'];
 
 const LANGUAGE_DISPLAY_NAMES = {
   hr: 'HRVAŠČINA',
   it: 'ITALIJANŠČINA',
-  en: 'ANGLEŠČINA',
-  whisper_en: 'WHISPER (ANG ZVOK)'
+  en: 'ANGLEŠČINA'
 };
 
 const cache = new Map();
@@ -317,8 +260,7 @@ function resolveSourceLanguages(meta, requested, strict) {
     return [req];
   }
   if (req && req !== 'auto' && SUPPORTED_SOURCE_LANGUAGES.includes(req)) {
-    const base = req === 'whisper_en' ? 'en' : req;
-    return [req, ...DEFAULT_LANGUAGE_PRIORITY.filter(l => l !== base)];
+    return [req, ...DEFAULT_LANGUAGE_PRIORITY.filter(l => l !== req)];
   }
   return [...DEFAULT_LANGUAGE_PRIORITY];
 }
@@ -384,8 +326,7 @@ async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season,
 
 async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode) {
   const headers = await openSubtitlesHeaders();
-  // Iskanje hr podpira tudi srp/hrv
-  const searchLang = language === 'hr' ? 'hr,srp,bos' : language === 'whisper_en' ? 'en' : language;
+  const searchLang = language === 'hr' ? 'hr,srp,bos' : language;
   const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: searchLang, order_by: 'downloads', order_direction: 'desc' };
   if (season && episode) {
     baseParams.season_number = season;
@@ -1024,7 +965,7 @@ function statusNoticeSrt(text) {
   return `0\n00:00:00,000 --> 00:00:04,000\n[Slo AI prevod] ${text}`;
 }
 
-const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi ANG, HR, ITA ali Whisper spodaj v seznamu.';
+const CHOOSE_PLACEHOLDER_SRT = '0\n00:00:00,000 --> 09:59:59,000\n[Slo AI prevod] To ni prevod. Izberi ANG, HR ali ITA spodaj v seznamu.';
 
 function buildPlaceholderSrt(lang = 'auto') {
   const langName = LANGUAGE_DISPLAY_NAMES[lang] || 'izbranega vira';
@@ -1179,8 +1120,7 @@ function createApp() {
       auto: 'Avtomatska izbira (HR -> IT -> EN)',
       hr: 'Prevod iz hrvaščine',
       it: 'Prevod iz italijanščine',
-      en: 'Prevod iz angleščine',
-      whisper_en: 'Whisper prevod'
+      en: 'Prevod iz angleščine'
     };
     const extraQuery = [
       videoHash ? `hash=${encodeURIComponent(videoHash)}` : null,
@@ -1197,9 +1137,9 @@ function createApp() {
     }
 
     const subtitles = [
-      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir (Hrvaščina / Italijanščina / Angleščina / Whisper) —' },
+      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir (Hrvaščina / Italijanščina / Angleščina) —' },
       { id: `slo-ai-${type}-${imdbId}-auto`, url: buildUrl('auto'), lang: 'slv', label: 'Slovenski AI prevod (Auto: HR -> IT -> EN)' },
-      ...['hr', 'it', 'en', 'whisper_en'].map(lang => ({
+      ...['hr', 'it', 'en'].map(lang => ({
         id: `slo-ai-${type}-${imdbId}-${lang}`,
         url: buildUrl(lang),
         lang: 'slv',
@@ -1286,7 +1226,5 @@ module.exports = {
   TRANSLATION_SCHEMA,
   buildTranslationSchema,
   withOpenSubtitlesLimit,
-  fetchOpenSubtitleForLanguage,
-  runLocalWhisperExtraction,
-  secondsToTimecode
+  fetchOpenSubtitleForLanguage
 };
