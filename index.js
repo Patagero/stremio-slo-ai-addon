@@ -1137,14 +1137,10 @@ function createApp() {
     }
 
     const subtitles = [
-      { id: `slo-ai-${type}-${imdbId}-choose`, url: buildUrl('choose'), lang: 'slv', label: '— Izberi vir (Hrvaščina / Italijanščina / Angleščina) —' },
       { id: `slo-ai-${type}-${imdbId}-auto`, url: buildUrl('auto'), lang: 'slv', label: 'Slovenski AI prevod (Auto: HR -> IT -> EN)' },
-      ...['hr', 'it', 'en'].map(lang => ({
-        id: `slo-ai-${type}-${imdbId}-${lang}`,
-        url: buildUrl(lang),
-        lang: 'slv',
-        label: sourceLangLabel[lang] || 'Slovenski prevod'
-      }))
+      { id: `slo-ai-${type}-${imdbId}-hr`, url: buildUrl('hr'), lang: 'slv', label: 'Prevod iz hrvaščine' },
+      { id: `slo-ai-${type}-${imdbId}-it`, url: buildUrl('it'), lang: 'slv', label: 'Prevod iz italijanščine' },
+      { id: `slo-ai-${type}-${imdbId}-en`, url: buildUrl('en'), lang: 'slv', label: 'Prevod iz angleščine' }
     ];
 
     return res.json({ subtitles });
