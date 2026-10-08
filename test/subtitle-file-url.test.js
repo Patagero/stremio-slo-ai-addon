@@ -56,3 +56,13 @@ test('a series id (tt1234567:season:episode) is split correctly: clean imdbId in
 
   await new Promise(resolve => server.close(resolve));
 });
+
+test('shiftSrtTimings shifts timecodes accurately without breaking format', () => {
+  const { shiftSrtTimings, autoDetectSyncOffset } = require('../index');
+  const srt = '1\n00:00:10,000 --> 00:00:14,000\nHello';
+  const shifted = shiftSrtTimings(srt, 2.5);
+  assert.match(shifted, /00:00:12,500 --> 00:00:16,500/);
+
+  const offset = autoDetectSyncOffset('movie.WEB-DL.srt', 'movie.BluRay.mkv');
+  assert.equal(offset, -1.0);
+});

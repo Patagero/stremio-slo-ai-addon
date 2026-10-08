@@ -3,12 +3,13 @@ const assert = require('node:assert/strict');
 const { systemPrompt, translateWithGemini, validateSlovenianSubtitle } = require('../index');
 
 test('full Slovenian prompt contains all requested quality rules', () => {
-  const prompt = systemPrompt('Title: Demo\nPlot: Story\nTMDB Cast Genders:\nAna: Female\n\nCHARACTER LEDGER (from dialogue analysis):\nAna: female [confidence: high]');
+  const prompt = systemPrompt('Title: Demo\nGenres: Action, Sci-Fi\nPlot: Story\nTMDB Cast Genders:\nAna: Female\n\nCHARACTER LEDGER (from dialogue analysis):\nAna: female [confidence: high]');
   for (const phrase of [
     'SPOLNO UJEMANJE',
     'CHARACTER LEDGER',
     'rekla sem',
     'rekel sem',
+    'ŽANRSKO PRILAGOJEN SLENG',
     'OMEJITEV VRSTIC',
     'tikanje',
     'vikanje',

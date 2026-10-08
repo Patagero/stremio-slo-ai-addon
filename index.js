@@ -190,13 +190,52 @@ function removeSdh(srtText) {
   return toSrt(entries);
 }
 
-// ---------- Reading-speed (CPS) helpers ----------
+// ---------- Reading-speed (CPS) & Timing Sync helpers ----------
+
+function secondsToTimecode(sec) {
+  const safeSec = Math.max(0, Number(sec) || 0);
+  const hours = Math.floor(safeSec / 3600);
+  const minutes = Math.floor((safeSec % 3600) / 60);
+  const seconds = Math.floor(safeSec % 60);
+  const ms = Math.floor((safeSec % 1) * 1000);
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
 
 function timecodeToSeconds(hms) {
-  const m = String(hms || '').trim().match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
+  const m = String(hms || '').trim().match(/^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})$/);
   if (!m) return 0;
   const [, hh, mm, ss, ms] = m;
   return Number(hh) * 3600 + Number(mm) * 60 + Number(ss) + Number(ms) / 1000;
+}
+
+function shiftSrtTimings(srtText, offsetSeconds = 0) {
+  if (!offsetSeconds || Math.abs(offsetSeconds) < 0.01) return srtText;
+  const entries = parseSrt(srtText);
+  const shifted = entries.map(entry => {
+    const [startStr, endStr] = String(entry.timecode || '').split(' --> ');
+    const startSec = Math.max(0, timecodeToSeconds(startStr) + offsetSeconds);
+    const endSec = Math.max(startSec + 0.3, timecodeToSeconds(endStr) + offsetSeconds);
+    return {
+      ...entry,
+      timecode: `${secondsToTimecode(startSec)} --> ${secondsToTimecode(endSec)}`
+    };
+  });
+  return toSrt(shifted);
+}
+
+function autoDetectSyncOffset(sourceFileName, videoFileName) {
+  const src = String(sourceFileName || '').toLowerCase();
+  const vid = String(videoFileName || '').toLowerCase();
+  if (!src || !vid) return 0;
+
+  const isSrcWeb = /web-?dl|webrip|\.web\./i.test(src);
+  const isVidWeb = /web-?dl|webrip|\.web\./i.test(vid);
+  const isSrcBluray = /bluray|bdrip|brrip/i.test(src);
+  const isVidBluray = /bluray|bdrip|brrip/i.test(vid);
+
+  if (isSrcWeb && isVidBluray) return -1.0;
+  if (isSrcBluray && isVidWeb) return 1.0;
+  return 0;
 }
 
 function cueDurationSeconds(entry) {
@@ -222,13 +261,13 @@ function findTooFastCues(entries) {
 // ---------- Metadata (TMDB) ----------
 
 async function tmdbMetadata(imdbId) {
-  if (!process.env.TMDB_API_KEY) return { title: imdbId, overview: 'Not provided', credits: [], originalLanguage: null };
+  if (!process.env.TMDB_API_KEY) return { title: imdbId, overview: 'Not provided', genres: [], credits: [], originalLanguage: null };
   const base = 'https://api.themoviedb.org/3';
   const find = await axios.get(`${base}/find/${encodeURIComponent(imdbId)}`, {
     params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', external_source: 'imdb_id' }
   });
   const item = find.data.movie_results?.[0] || find.data.tv_results?.[0];
-  if (!item) return { title: imdbId, overview: 'Not provided', credits: [], originalLanguage: null };
+  if (!item) return { title: imdbId, overview: 'Not provided', genres: [], credits: [], originalLanguage: null };
   const type = find.data.movie_results?.length ? 'movie' : 'tv';
   const details = await axios.get(`${base}/${type}/${item.id}`, {
     params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', append_to_response: 'credits' }
@@ -236,6 +275,7 @@ async function tmdbMetadata(imdbId) {
   return {
     title: details.data.title || details.data.name || imdbId,
     overview: details.data.overview || 'Not provided',
+    genres: (details.data.genres || []).map(g => g.name),
     originalLanguage: details.data.original_language || null,
     credits: (details.data.credits?.cast || []).slice(0, 20).map(c => ({
       name: c.character ? `${c.character} (${c.name})` : c.name,
@@ -249,7 +289,8 @@ function buildMetadataContext(meta = {}) {
   const characters = (meta.credits || [])
     .map(c => `${c.name}: ${genderLabel[c.gender] || 'Unknown'}`)
     .join('\n') || 'No character gender metadata available.';
-  return `Title: ${meta.title || 'Unknown'}\nPlot: ${meta.overview || 'Not provided'}\nTMDB Cast Genders:\n${characters}`;
+  const genresText = (meta.genres && meta.genres.length) ? meta.genres.join(', ') : 'General';
+  return `Title: ${meta.title || 'Unknown'}\nGenres: ${genresText}\nPlot: ${meta.overview || 'Not provided'}\nTMDB Cast Genders:\n${characters}`;
 }
 
 // ---------- 1. OpenSubtitles Iskanje po Prioriteti (HR -> IT -> EN) ----------
@@ -561,16 +602,23 @@ CORE TRANSLATION & SUBTITLING RULES:
 - V hrvaščini in italijanščini izkoristi očitne spolne končnice izvirnika ("rekla sam" -> "rekla sem", "sono andata" -> "šla sem").
 - Pravilno uporabljaj slovensko dvojino (npr. "greva", "bova videla/videli").
 
-2. OMEJITEV VRSTIC IN HITROST BRANJA (MAX 2 VRSTICI):
+2. ŽANRSKO PRILAGOJEN SLENG, KLETVICE IN NARAVNI FILMSKI IDIOM:
+- Akcija / Kriminalka / Triler: Uporabljaj surov, naraven filmski pogovorni jezik, ulični sleng in pristne slovenske kletvice ("fak", "daj no", "stari", "mater", "k vragu", "kaj dogaja", "gremo"). Brez zastarelih ali prisiljenih knjižnih izrazov.
+- Komedija: Živahni, duhoviti in naravni slovenski idiomi ter situacijske šale (ne prevajaj tujih šal dobesedno, ampak jih prilagodi slovenskemu duhu).
+- Znanstvena fantastika (Sci-Fi): Uveljavljena slovenska terminologija (nadsvetlobni pogon, ščiti, senzorji, teleportacija, hiper-skok).
+- Zgodovinski film / Drama: Rahlo uglajenejši jezik z doslednim vikanjem med uradnimi osebami in gospodo.
+- Animacija / Risanka: Prijazen, igriv in naraven slovenski jezik, prilagojen celotni družini.
+
+3. OMEJITEV VRSTIC IN HITROST BRANJA (MAX 2 VRSTICI):
 - Vsak posamezen podnapis (cue) mora biti razdeljen na NAJVEČ DVE KRATKI VRSTICI (max ${MAX_LINE_CHARS} znakov na vrstico).
 - Za udobno branje na zaslonu se drži hitrosti ${TARGET_CPS} znakov na sekundo glede na čas trajanja.
-- Strni predolgo besedilo: izpusti odvečne mašila in ponavljanja ter ohrani bistvo in ton dialoga.
+- Strni predolgo besedilo: izpusti odvečna mašila in ponavljanja ter ohrani bistvo in ton dialoga.
 
-3. NARAVEN POGOVORNI JEZIK:
+4. NARAVEN POGOVORNI JEZIK:
 - Uporabljaj naravno, tekočo pogovorno slovenščino. Brez dobesednih ali robotskih prevodov.
 - Ohrani dosledno tikanje ali vikanje glede na odnose med liki.
 
-4. POPOLNA TEHNIČNA INTEGRITETA SRT:
+5. POPOLNA TEHNIČNA INTEGRITETA SRT:
 - Ohraniti moraš točne ID številke vseh podnapisov.
 - Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","text":"Prva vrstica\\nDruga vrstica"}]}`;
 }
@@ -1299,5 +1347,7 @@ module.exports = {
   TRANSLATION_SCHEMA,
   buildTranslationSchema,
   withOpenSubtitlesLimit,
-  fetchOpenSubtitleForLanguage
+  fetchOpenSubtitleForLanguage,
+  shiftSrtTimings,
+  autoDetectSyncOffset
 };
