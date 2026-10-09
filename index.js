@@ -150,7 +150,13 @@ function reconcileTranslatedSrt(source, candidate) {
   const byId = new Map(translated.map(entry => [String(entry.id), entry]));
   const repaired = original.map(entry => {
     const found = byId.get(String(entry.id));
-    return { id: entry.id, timecode: entry.timecode, text: found?.text?.trim() || entry.text };
+    let text = found?.text?.trim() || entry.text;
+    // Očisti tehnične oznake govorca [Govorec: ...] in formatiraj na max 2 vrstici
+    text = text.replace(/\[(?:Govorec|Govorita|Speaker)[^\]]*\]/gi, '').replace(/\s{2,}/g, ' ').trim();
+    if (text.length > MAX_LINE_CHARS && !text.includes('\n')) {
+      text = splitIntoTwoLines(text);
+    }
+    return { id: entry.id, timecode: entry.timecode, text };
   });
   return toSrt(repaired);
 }
@@ -160,13 +166,45 @@ function validateSlovenianSubtitle(text) {
   return lines.length <= MAX_LINES && lines.every(line => line.length <= MAX_LINE_CHARS);
 }
 
-// ---------- 2. ČIŠČENJE SDH (Subtitles for the Deaf and Hard of Hearing) ----------
+// ---------- 2. ČIŠČENJE SDH (Subtitles for the Deaf and Hard of Hearing) IN PREPOZNAVA SPOLA GOVORCA ----------
 
 const SDH_BRACKET_RE = /\[[^\]\n]*\]/g;
 const SDH_PAREN_RE = /\((?:laughter|giggle|gasp|sobbing|crying|music|sigh|groan|screaming|whisper|cough|applause|cheering|chuckle|snicker)[^)\n]*\)/gi;
 const SDH_ASTERISK_RE = /\*[^*]*\*/g;
 const SDH_MUSIC_NOTE_RE = /[♪♫][^♪♫\n]*[♪♫]?/g;
-const SDH_SPEAKER_LABEL_RE = /^[-\s]*[A-ZČŠŽ0-9 .'-]{2,30}:\s*/;
+const SDH_SPEAKER_LABEL_RE = /^[-\s]*[A-ZČŠŽĐĆ0-9 .'-]{2,30}:\s*/;
+const SPEAKER_TAG_CLEAN_RE = /\[(?:Govorec|Govorita|Speaker)[^\]]*\]/gi;
+
+function extractSpeakerFromRawText(rawText) {
+  const m = String(rawText || '').match(/^[-\s]*([A-ZČŠŽĐĆa-z0-9 .'-]{2,25}):\s*/);
+  if (m) return m[1].trim();
+  const bm = String(rawText || '').match(/^\[([A-ZČŠŽĐĆa-z0-9 .'-]{2,25})\]\s*/);
+  if (bm) return bm[1].trim();
+  return null;
+}
+
+function detectGenderFromDialogue(text) {
+  const t = String(text || '').toLowerCase();
+  // Hrvaške / Srbske / Bosanske ženske končnice
+  if (/\b(rekla|bila|vidjela|vidila|htjela|mogla|srećna|sretna|spremna|sama|sigurna|zadovoljna|znala|mislila|osjetila|došla|otišla|morala)\s+(sam|sam bila|bih)\b/i.test(t) ||
+      /\b(sam|sam bila)\s+(rekla|bila|vidjela|vidila|htjela|mogla|srećna|sretna|spremna|sama|sigurna|zadovoljna|znala|mislila|osjetila|došla|otišla|morala)\b/i.test(t)) {
+    return 'Ženska';
+  }
+  // Hrvaške / Srbske / Bosanske moške končnice
+  if (/\b(rekao|bio|vidio|htio|mogao|srećan|sretan|spreman|sam|siguran|zadovoljan|znao|mislio|osjetio|došao|otišao|morao)\s+(sam|sam bio|bih)\b/i.test(t) ||
+      /\b(sam|sam bio)\s+(rekao|bio|vidio|htio|mogao|srećan|sretan|spreman|sam|siguran|zadovoljan|znao|mislio|osjetio|došao|otišao|morao)\b/i.test(t)) {
+    return 'Moški';
+  }
+  // Italijanske ženske končnice
+  if (/\b(sono|ero|stata)\s+(andata|arrivata|stata|venuta|rimasta|tornata|contenta|sicura|sola|pronta)\b/i.test(t)) {
+    return 'Ženska';
+  }
+  // Italijanske moške končnice
+  if (/\b(sono|ero|stato)\s+(andato|arrivato|stato|venuto|rimasto|tornato|contento|sicuro|solo|pronto)\b/i.test(t)) {
+    return 'Moški';
+  }
+  return null;
+}
 
 function stripSdhFromLine(line) {
   return String(line || '')
@@ -179,14 +217,44 @@ function stripSdhFromLine(line) {
     .trim();
 }
 
-function removeSdh(srtText) {
-  const entries = parseSrt(srtText)
-    .map(entry => ({
+function removeSdhEntries(srtText, characterMap = new Map()) {
+  const parsed = parseSrt(srtText);
+  const entries = [];
+  let index = 1;
+
+  for (const entry of parsed) {
+    const rawLines = entry.text.split('\n');
+    let detectedSpeaker = null;
+    let detectedGender = null;
+
+    for (const line of rawLines) {
+      if (!detectedSpeaker) detectedSpeaker = extractSpeakerFromRawText(line);
+      if (!detectedGender) detectedGender = detectGenderFromDialogue(line);
+    }
+
+    if (detectedSpeaker && characterMap && characterMap.has(detectedSpeaker.toLowerCase())) {
+      const g = characterMap.get(detectedSpeaker.toLowerCase());
+      if (g) detectedGender = g;
+    }
+
+    const cleanedLines = rawLines.map(stripSdhFromLine).filter(Boolean);
+    if (!cleanedLines.length) continue;
+
+    const genderTag = detectedGender ? `[Govorec: ${detectedGender}]` : '';
+
+    entries.push({
       ...entry,
-      text: entry.text.split('\n').map(stripSdhFromLine).filter(Boolean).join('\n')
-    }))
-    .filter(entry => entry.text.trim().length > 0)
-    .map((entry, index) => ({ ...entry, id: String(index + 1) }));
+      id: String(index++),
+      text: cleanedLines.join('\n'),
+      genderTag
+    });
+  }
+
+  return entries;
+}
+
+function removeSdh(srtText, characterMap = new Map()) {
+  const entries = removeSdhEntries(srtText, characterMap);
   return toSrt(entries);
 }
 
@@ -595,12 +663,14 @@ ${context}
 
 CORE TRANSLATION & SUBTITLING RULES:
 
-1. SPOLNO UJEMANJE (ONA / ON) — KRITIČNO:
-- Dosledno uporabljaj določen slovnični spol iz CHARACTER LEDGER tabele.
-- Ženske oblike: "rekla sem", "prišla sem", "bila sem", "vesela sem", "si videla?", "si pripravljena?".
-- Moške oblike: "rekel sem", "prišel sem", "bil sem", "vesel sem", "si videl?", "si pripravljen?".
-- V hrvaščini in italijanščini izkoristi očitne spolne končnice izvirnika ("rekla sam" -> "rekla sem", "sono andata" -> "šla sem").
+1. SPOLNO UJEMANJE (ONA / ON) — ZVOČNA/TEKSTOVNA ANALIZA GOVORCA (KRITIČNO):
+- Vsak cue ima lahko dodeljeno dinamično oznako govorca, npr. [Govorec: Ženska] ali [Govorec: Moški].
+- BREZPOGOJNO upoštevaj te dodeljene oznake spola za vsako posamezno vrstico pri izbiri glagolskih oblik, pridevnikov in zaimkov!
+- ŽENSKA ([Govorec: Ženska]): obvezno uporabi ženske oblike glagolov v pretekliku ("rekla sem", "prišla sem", "bila sem", "videla sem", "si videla?", "si pripravljena?"), ženske pridevnike ("sama", "vesela", "utrujena", "hvaležna") in ustrezne ženske zaimke.
+- MOŠKI ([Govorec: Moški]): obvezno uporabi moške oblike ("rekel sem", "prišel sem", "bil sem", "videl sem", "si videl?", "si pripravljen?", "sam", "vesel").
+- V hrvaščini in italijanščini dodatno izkoristi očitne spolne končnice izvirnika ("rekla sam" -> "rekla sem", "sono andata" -> "šla sem").
 - Pravilno uporabljaj slovensko dvojino (npr. "greva", "bova videla/videli").
+- POMEMBNO: Tehničnih oznak [Govorec: ...] NIKOLI ne vključuj v končno besedilo prevoda!
 
 2. ŽANRSKO PRILAGOJEN SLENG, KLETVICE IN NARAVNI FILMSKI IDIOM:
 - Akcija / Kriminalka / Triler: Uporabljaj surov, naraven filmski pogovorni jezik, ulični sleng in pristne slovenske kletvice ("fak", "daj no", "stari", "mater", "k vragu", "kaj dogaja", "gremo"). Brez zastarelih ali prisiljenih knjižnih izrazov.
@@ -627,9 +697,12 @@ function buildTranslationUserText(sourceEntries) {
   const lines = sourceEntries.map(entry => {
     const duration = cueDurationSeconds(entry).toFixed(1);
     const budget = maxCharsForDuration(cueDurationSeconds(entry));
-    return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${entry.text.replace(/\n/g, ' / ')}`;
+    const tag = entry.genderTag ? `${entry.genderTag} ` : '';
+    return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${tag}${entry.text.replace(/\n/g, ' / ')}`;
   });
-  return `Translate each cue into natural Slovenian (max 2 lines per cue, observe gender). Return JSON: {"translations": [{"id": "...", "text": "..."}]}
+  return `Prevedi vsak cue v naravno slovenščino (max 2 vrstici na cue, strogo upoštevaj označeni spol govorca [Govorec: ...]).
+V izhodu NE vključuj tehničnih oznak [Govorec: ...], ampak samo čist slovenski dialog.
+Return JSON: {"translations": [{"id": "...", "text": "..."}]}
 
 SOURCE CUES:
 ${lines.join('\n')}`;
@@ -816,18 +889,31 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
       }
     }
 
-    // 2. Čiščenje SDH
-    const source = removeSdh(rawSource);
-    console.log(`[translation] ${imdbId}: cues after SDH cleanup=${parseSrt(source).length}/${parseSrt(rawSource).length}`);
+    // 2. Analiza likov in spolov s Gemini 3.1 Pro + TMDB
+    const characters = await analyzeCharacters(rawSource, meta);
+    const characterMap = new Map();
+    for (const c of characters) {
+      if (c.name && c.gender) {
+        characterMap.set(c.name.toLowerCase(), c.gender === 'female' ? 'Ženska' : (c.gender === 'male' ? 'Moški' : null));
+      }
+    }
+    for (const c of (meta.credits || [])) {
+      if (c.name && c.gender) {
+        const mapped = c.gender === 1 ? 'Ženska' : (c.gender === 2 ? 'Moški' : null);
+        if (mapped) characterMap.set(c.name.toLowerCase(), mapped);
+      }
+    }
 
-    // 3. Analiza likov in spolov s Gemini 3.1 Pro
-    const characters = await analyzeCharacters(source, meta);
+    // 3. Čiščenje SDH z dinamičnim dodeljevanjem spola govorca
+    const sourceEntries = removeSdhEntries(rawSource, characterMap);
+    const source = toSrt(sourceEntries);
+    const taggedCount = sourceEntries.filter(e => e.genderTag).length;
+    console.log(`[translation] ${imdbId}: cues after SDH cleanup=${sourceEntries.length}/${parseSrt(rawSource).length} (gender-tagged: ${taggedCount}/${sourceEntries.length})`);
+
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
+    const chunks = chunkSrt(sourceEntries, CHUNK_SIZE);
+    console.log(`[translation] ${imdbId}: translating ${sourceEntries.length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${GEMINI_MODEL}`);
 
-    const chunks = chunkSrt(source, CHUNK_SIZE);
-    console.log(`[translation] ${imdbId}: translating ${parseSrt(source).length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${GEMINI_MODEL}`);
-
-    const sourceEntries = parseSrt(source);
     const sourceIds = sourceEntries.map(e => e.id);
     const savedPartial = loadPartialFromDisk(key);
     const resumable = savedPartial
