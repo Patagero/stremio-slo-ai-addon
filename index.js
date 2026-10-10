@@ -66,7 +66,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.1',
+  version: '0.7.2',
   name: 'Slo AI Subtitle Translator (Gemini 3.1 Pro)',
   description: 'Vrhunski slovenski podnapisi z Gemini 3.1 Pro: samodejna izbira vira (HR -> IT -> EN), natančno SDH čiščenje in spolno ujemanje (on/ona).',
   resources: ['subtitles'],
@@ -1329,6 +1329,14 @@ function createApp() {
     const explicitLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
     const videoHash = parseExtraHash(req.params[2]).videoHash;
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
+
+    // Takojšnji samodejni zagon v ozadju ob odprtju filma v Stremio (pre-fetch)
+    const primaryLang = explicitLanguage || 'hr';
+    const primaryKey = buildCacheKey(imdbId, primaryLang, videoHash, season, episode);
+    if (!cache.has(primaryKey) && !inflight.has(primaryKey)) {
+      startTranslationJob(imdbId, primaryKey, primaryLang, videoHash, false, season, episode);
+    }
+
     const sourceLangLabel = {
       hr: 'Prevod iz HR',
       it: 'Prevod iz IT',
