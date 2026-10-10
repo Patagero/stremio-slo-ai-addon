@@ -1326,17 +1326,25 @@ function createApp() {
     // Zaženemo prevod / iskanje slovenskih podnapisov
     try {
       // strict = false omogoča samodejni prehod na naslednje jezike po prioriteti (HR -> IT -> EN)
-      const translationPromise = translateSubtitle(imdbId, lang, videoHash, false, season, episode);
-      
-      // Če najde slovenske podnapise na OpenSubtitles, se zaključi takoj (v 1-2s).
-      // Počakamo do 8 sekund, preden bi morda vrnili delno obvestilo.
-      const immediateResult = await Promise.race([
-        translationPromise,
-        new Promise(resolve => setTimeout(() => resolve(null), 8000))
-      ]);
+      translateSubtitle(imdbId, lang, videoHash, false, season, episode).catch(err => {
+        console.error(`[translation] ${imdbId}: ${err.message}`);
+      });
 
-      if (immediateResult) {
-        return res.type('application/x-subrip; charset=utf-8').send(immediateResult);
+      // Takoj ko je preveden 1. chunk (ali celoten film), postrežemo podnapise brez čakanja!
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline) {
+        const full = cache.get(key);
+        if (full && full.srt) {
+          return res.type('application/x-subrip; charset=utf-8').send(full.srt);
+        }
+        const partial = partials.get(key);
+        if (partial && partial.doneChunkIndices && partial.doneChunkIndices.size >= 1) {
+          const body = partialToSrt(partial);
+          const notice = partial.sourceNotice || getTranslationNotice(lang);
+          const combined = prependNoticeCue(body, notice);
+          return res.type('application/x-subrip; charset=utf-8').send(combined);
+        }
+        await new Promise(resolve => setTimeout(resolve, 400));
       }
     } catch (error) {
       console.error(`[translation] ${imdbId}: ${error.message}`);
