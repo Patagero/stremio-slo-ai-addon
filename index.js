@@ -119,14 +119,52 @@ function toSrt(entries) {
     .join('\n\n') + '\n';
 }
 
-function chunkSrt(srt, chunkSize = CHUNK_SIZE) {
-  const entries = parseSrt(srt);
+function chunkSrt(srtOrEntries, chunkSize = CHUNK_SIZE) {
+  const entries = Array.isArray(srtOrEntries) ? srtOrEntries : parseSrt(srtOrEntries);
   const chunks = [];
   for (let i = 0; i < entries.length; i += chunkSize) {
     const slice = entries.slice(i, i + chunkSize);
     chunks.push({ index: chunks.length, entries: slice, srt: toSrt(slice) });
   }
   return chunks;
+}
+
+function splitIntoTwoLines(text, maxChars = MAX_LINE_CHARS) {
+  if (text.length <= maxChars) return text;
+  const breakWords = [', ', ' - ', ' in ', ' da ', ' pa ', ' ker ', ' ko ', ' ampak ', ' ali ', ' zato ', '. ', '? ', '! ', ' '];
+  for (const bw of breakWords) {
+    const parts = text.split(bw);
+    if (parts.length < 2) continue;
+    let runningLen = 0;
+    let bestPos = 0;
+    let bestDiff = Infinity;
+    for (let i = 0; i < parts.length - 1; i++) {
+      runningLen += parts[i].length + bw.length;
+      const otherLen = text.length - runningLen;
+      const diff = Math.abs(runningLen - otherLen);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestPos = runningLen;
+      }
+    }
+    if (bestPos > 0) {
+      const line1 = text.slice(0, bestPos).trim();
+      const line2 = text.slice(bestPos).trim();
+      if (line1.length <= maxChars && line2.length <= maxChars) {
+        return `${line1}\n${line2}`;
+      }
+    }
+  }
+  // Sredinski prelom na najbližjem presledku
+  const mid = Math.floor(text.length / 2);
+  for (let offset = 0; offset < 25; offset++) {
+    for (const pos of [mid + offset, mid - offset]) {
+      if (pos > 0 && pos < text.length && text[pos] === ' ') {
+        return `${text.slice(0, pos).trim()}\n${text.slice(pos + 1).trim()}`;
+      }
+    }
+  }
+  return text;
 }
 
 function parseAndValidateSrt(source, translated) {
