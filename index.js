@@ -471,11 +471,37 @@ async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season,
   return withOpenSubtitlesLimit(() => fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode));
 }
 
+function isSubtitleComplete(srtText, isSeries = false) {
+  if (!srtText || typeof srtText !== 'string' || srtText.length < 500) return false;
+  const entries = parseSrt(srtText);
+  if (!entries || entries.length === 0) return false;
+
+  const count = entries.length;
+  const lastEntry = entries[entries.length - 1];
+  const lastSec = lastEntry.endTime ? parseTimecode(lastEntry.endTime) : 0;
+
+  if (!isSeries) {
+    // Za film: vsaj 200 podnapisov in trajanje vsaj 40 minut (2400s)
+    if (count < 200 || lastSec < 2400) {
+      console.warn(`[quality] Zavrnjen nepopoln podnapis filma (${count} vrstic, trajanje ${(lastSec/60).toFixed(1)} min)`);
+      return false;
+    }
+  } else {
+    // Za serijo: vsaj 75 podnapisov in trajanje vsaj 12 minut (720s)
+    if (count < 75 || lastSec < 720) {
+      console.warn(`[quality] Zavrnjen nepopoln podnapis serije (${count} vrstic, trajanje ${(lastSec/60).toFixed(1)} min)`);
+      return false;
+    }
+  }
+  return true;
+}
+
 async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode) {
   const headers = await openSubtitlesHeaders();
   const searchLang = language === 'hr' ? 'hr,srp,bos' : language;
   const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: searchLang, order_by: 'downloads', order_direction: 'desc' };
-  if (season && episode) {
+  const isSeries = Boolean(season && episode);
+  if (isSeries) {
     baseParams.season_number = season;
     baseParams.episode_number = episode;
   }
@@ -486,15 +512,19 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash,
         headers,
         params: { ...baseParams, moviehash: videoHash, moviehash_match: 'only' }
       });
-      const hashResult = hashSearch.data.data?.[0];
-      const hashFile = hashResult?.attributes?.files?.[0];
-      const fileName = hashFile?.file_name || `${imdbId}.${language}.srt`;
-      const verifiedMatch = hashResult?.attributes?.moviehash_match !== false;
-      if (hashFile?.file_id && verifiedMatch) {
-        const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: hashFile.file_id }, { headers });
-        if (download.data.link) {
-          const srt = (await axios.get(download.data.link)).data;
-          return { srt, language, fileName, matchedByHash: true };
+      const hashResults = hashSearch.data.data || [];
+      for (const hashResult of hashResults.slice(0, 3)) {
+        const hashFile = hashResult?.attributes?.files?.[0];
+        const fileName = hashFile?.file_name || `${imdbId}.${language}.srt`;
+        const verifiedMatch = hashResult?.attributes?.moviehash_match !== false;
+        if (hashFile?.file_id && verifiedMatch) {
+          const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: hashFile.file_id }, { headers });
+          if (download.data.link) {
+            const srt = (await axios.get(download.data.link)).data;
+            if (isSubtitleComplete(srt, isSeries)) {
+              return { srt, language, fileName, matchedByHash: true };
+            }
+          }
         }
       }
     } catch (error) {
@@ -503,14 +533,24 @@ async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash,
   }
 
   const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', { headers, params: baseParams });
-  const result = search.data.data?.[0];
-  const file = result?.attributes?.files?.[0];
-  const fileName = file?.file_name || `${imdbId}.${language}.srt`;
-  if (!file?.file_id) return null;
-  const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers });
-  if (!download.data.link) return null;
-  const srt = (await axios.get(download.data.link)).data;
-  return { srt, language, fileName, matchedByHash: false };
+  const results = search.data.data || [];
+  for (const result of results.slice(0, 4)) {
+    const file = result?.attributes?.files?.[0];
+    const fileName = file?.file_name || `${imdbId}.${language}.srt`;
+    if (!file?.file_id) continue;
+    try {
+      const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers });
+      if (!download.data.link) continue;
+      const srt = (await axios.get(download.data.link)).data;
+      if (isSubtitleComplete(srt, isSeries)) {
+        return { srt, language, fileName, matchedByHash: false };
+      }
+      console.warn(`[opensubtitles] kandidat ${fileName} za ${language} je nepopoln, preverjam naslednjega...`);
+    } catch (dlErr) {
+      console.warn(`[opensubtitles] download failed for file_id ${file.file_id}: ${dlErr.message}`);
+    }
+  }
+  return null;
 }
 
 function prependNoticeCue(srtText, noticeMessage) {
