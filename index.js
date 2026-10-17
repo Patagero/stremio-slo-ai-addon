@@ -28,19 +28,19 @@ const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FI
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
-// Google Gemini 3.1 Pro konfiguracija
+// Google Gemini Flash konfiguracija (15x ceneje, bliskovito hitro)
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || GEMINI_MODEL;
 const providerConfig = { name: 'gemini', model: GEMINI_MODEL };
 
 const GEMINI_FALLBACK_MODELS = [
   GEMINI_MODEL,
-  'gemini-3.1-pro-preview',
-  'gemini-2.5-pro',
   'gemini-2.5-flash',
   'gemini-3.7-flash',
-  'gemini-2.0-flash'
+  'gemini-2.0-flash',
+  'gemini-3.1-pro-preview',
+  'gemini-2.5-pro'
 ];
 
 // Ciljna hitrost branja (characters per second) in omejitev vrstic
@@ -66,9 +66,9 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.2',
-  name: 'Slo AI Subtitle Translator (Gemini 3.1 Pro)',
-  description: 'Vrhunski slovenski podnapisi z Gemini 3.1 Pro: samodejna izbira vira (HR -> IT -> EN), natančno SDH čiščenje in spolno ujemanje (on/ona).',
+  version: '0.7.4',
+  name: 'Slo AI Subtitle Translator (Gemini Flash)',
+  description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
