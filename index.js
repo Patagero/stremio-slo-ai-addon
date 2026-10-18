@@ -22,13 +22,14 @@ try {
 } catch (_) {}
 
 const PORT = Number(process.env.PORT || 7002);
-const CHUNK_SIZE = Math.max(30, Math.min(50, Number(process.env.CHUNK_SIZE || 40)));
-const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.TRANSLATION_CONCURRENCY || 2)));
+// Optimizacija velikosti chunkov (5-8 večjih chunkov na film namesto 40 majhnih za 80% manj API klicev in hitrejšo obdelavo)
+const CHUNK_SIZE = Math.max(100, Math.min(350, Number(process.env.CHUNK_SIZE || 220)));
+const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.TRANSLATION_CONCURRENCY || 2)));
 const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FILE_TIMEOUT_MS || 300000));
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
-// Google Gemini Flash konfiguracija (15x ceneje, bliskovito hitro)
+// Google Gemini Flash konfiguracija (optimiziran model, 15x ceneje, bliskovito hitro)
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || GEMINI_MODEL;
@@ -40,7 +41,7 @@ const GEMINI_FALLBACK_MODELS = [
   'gemini-3.7-flash',
   'gemini-2.0-flash',
   'gemini-3.1-pro-preview',
-  'gemini-2.5-pro'
+  'gemini-2.5-pro',
 ];
 
 // Ciljna hitrost branja (characters per second) in omejitev vrstic

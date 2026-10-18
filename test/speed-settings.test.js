@@ -3,8 +3,8 @@ const assert = require('node:assert/strict');
 const { CHUNK_SIZE, TRANSLATION_CONCURRENCY, SUBTITLE_FILE_TIMEOUT_MS } = require('../index');
 
 test('speed settings use large chunks, bounded parallelism, and a long file timeout', () => {
-  assert.ok(CHUNK_SIZE >= 30 && CHUNK_SIZE <= 50);
-  assert.ok(TRANSLATION_CONCURRENCY >= 1 && TRANSLATION_CONCURRENCY <= 3);
+  assert.ok(CHUNK_SIZE >= 100 && CHUNK_SIZE <= 350);
+  assert.ok(TRANSLATION_CONCURRENCY >= 1 && TRANSLATION_CONCURRENCY <= 4);
   assert.ok(SUBTITLE_FILE_TIMEOUT_MS >= 300000);
 });
 
