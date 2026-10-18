@@ -722,11 +722,15 @@ CORE TRANSLATION & SUBTITLING RULES:
 - Za udobno branje na zaslonu se drži hitrosti ${TARGET_CPS} znakov na sekundo glede na čas trajanja.
 - Strni predolgo besedilo: izpusti odvečna mašila in ponavljanja ter ohrani bistvo in ton dialoga.
 
-4. NARAVEN POGOVORNI JEZIK:
+4. VARNOSTNO PRAVILO ZA SPOL (FALLBACK NA NEVTRALNOST):
+- Če pri določenem stavku ali dialogu nisi 100-odstotno prepričan o spolu govorca (ker kontekst ni jasen ali ni zvočne/tekstovne oznake), se STROGO IZOGNI izpostavljanju spola.
+- V takih primerih kreativno obrni stavek, spremeni strukturo ali uporabi nevtralen izraz, ki spola neizogibno ne izdaja (npr. sedanji čas, brezoosebna oblika, preoblikovan stavek, "treba je", "ravnokar prihajam", "kaj se je zgodilo?"), da preprečiš slovnično napačno spolno ujemanje.
+
+5. NARAVEN POGOVORNI JEZIK:
 - Uporabljaj naravno, tekočo pogovorno slovenščino. Brez dobesednih ali robotskih prevodov.
 - Ohrani dosledno tikanje ali vikanje glede na odnose med liki.
 
-5. POPOLNA TEHNIČNA INTEGRITETA SRT:
+6. POPOLNA TEHNIČNA INTEGRITETA SRT:
 - Ohraniti moraš točne ID številke vseh podnapisov.
 - Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","text":"Prva vrstica\\nDruga vrstica"}]}`;
 }
