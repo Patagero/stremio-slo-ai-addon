@@ -22,8 +22,12 @@ try {
 } catch (_) {}
 
 const PORT = Number(process.env.PORT || 7002);
-// Optimizacija velikosti chunkov (5-8 večjih chunkov na film namesto 40 majhnih za 80% manj API klicev in hitrejšo obdelavo)
-const CHUNK_SIZE = Math.max(100, Math.min(350, Number(process.env.CHUNK_SIZE || 220)));
+// Velikost chunka je zdaj manjša, da model ne porabi celotnega izhodnega proračuna
+// za razmišljanje in da se izogne praznim/okrnjenim odgovorom. Če pride do napake,
+// se chunk samodejno razdeli na manjše dele.
+const CHUNK_SIZE = Math.max(60, Math.min(250, Number(process.env.CHUNK_SIZE || 120)));
+const MIN_SPLIT_CHUNK_SIZE = Math.max(10, Math.min(100, Number(process.env.MIN_SPLIT_CHUNK_SIZE || 30)));
+const MAX_SPLIT_DEPTH = Math.max(0, Math.min(5, Number(process.env.MAX_SPLIT_DEPTH || 3)));
 const TRANSLATION_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.TRANSLATION_CONCURRENCY || 2)));
 const SUBTITLE_FILE_TIMEOUT_MS = Math.max(300000, Number(process.env.SUBTITLE_FILE_TIMEOUT_MS || 300000));
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
@@ -42,6 +46,19 @@ const GEMINI_FALLBACK_MODELS = [
   'gemini-2.0-flash',
   'gemini-3.1-pro-preview',
   'gemini-2.5-pro',
+];
+
+// Gemini 3.x privzeto vklopi "thinking", ki porabi isti proračun kot izhod.
+// Pri prevajanju podnapisov to povzroči prazne odgovore (MAX_TOKENS), zato
+// razmišljanje omejimo in izhodni proračun izračunamo glede na število cue-jev.
+const GEMINI_THINKING_LEVEL = process.env.GEMINI_THINKING_LEVEL || 'low';
+const GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.GEMINI_MAX_OUTPUT_TOKENS || 32768));
+const GEMINI_SAFETY_SETTINGS = [
+  { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
+  { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' },
+  { category: 'HARM_CATEGORY_JAILBREAK', threshold: 'BLOCK_ONLY_HIGH' }
 ];
 
 // Ciljna hitrost branja (characters per second) in omejitev vrstic
@@ -67,7 +84,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.4',
+  version: '0.7.6',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -547,7 +564,30 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
 
 // ---------- 3. VRHUNSKI PREVOD Z GEMINI 3.1 PRO ----------
 
-function buildGeminiRequest(systemText, userText, model = GEMINI_MODEL) {
+function buildGeminiGenerationConfig(model, options = {}) {
+  const generationConfig = {
+    responseMimeType: 'application/json'
+  };
+
+  // Gemini 3.6+ je opustil temperature/top_p/top_k. Starejši modeli jih še podpirajo.
+  if (!/^gemini-(?:3\.[6-9]|4(?:\.|$))/i.test(model)) {
+    generationConfig.temperature = 0.2;
+  }
+  if (options.maxOutputTokens) {
+    generationConfig.maxOutputTokens = options.maxOutputTokens;
+  }
+
+  // Gemini 3.x uporablja thinkingLevel, Gemini 2.5 pa thinkingBudget.
+  if (/^gemini-(?:3|4)/i.test(model)) {
+    generationConfig.thinkingConfig = { thinkingLevel: GEMINI_THINKING_LEVEL };
+  } else if (/^gemini-2\.5/i.test(model)) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
+  return generationConfig;
+}
+
+function buildGeminiRequest(systemText, userText, model = GEMINI_MODEL, options = {}) {
   return {
     url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     body: {
@@ -557,12 +597,15 @@ function buildGeminiRequest(systemText, userText, model = GEMINI_MODEL) {
           parts: [{ text: `${systemText}\n\n---\n\n${userText}` }]
         }
       ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.2
-      }
+      generationConfig: buildGeminiGenerationConfig(model, options),
+      safetySettings: GEMINI_SAFETY_SETTINGS
     }
   };
+}
+
+function computeTranslationMaxOutputTokens(entryCount) {
+  const count = Math.max(1, Number(entryCount) || 1);
+  return Math.max(4096, Math.min(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, count * 96));
 }
 
 function extractGeminiOutputText(data) {
@@ -580,7 +623,7 @@ async function translateWithGemini(systemText, userText, options = {}) {
   let lastError = null;
 
   for (const currentModel of modelsToTry) {
-    const request = buildGeminiRequest(systemText, userText, currentModel);
+    const request = buildGeminiRequest(systemText, userText, currentModel, options);
     const urlWithKey = `${request.url}?key=${apiKey}`;
     const response = await fetchImpl(urlWithKey, {
       method: 'POST',
@@ -592,11 +635,24 @@ async function translateWithGemini(systemText, userText, options = {}) {
 
     if (response.ok) {
       const data = await response.json();
-      return extractGeminiOutputText(data).trim();
+      const text = extractGeminiOutputText(data).trim();
+      if (text) return text;
+
+      const finishReason = data?.candidates?.[0]?.finishReason || 'UNKNOWN';
+      const blockReason = data?.promptFeedback?.blockReason || '';
+      const thoughts = data?.usageMetadata?.thoughtsTokenCount || 0;
+      lastError = new Error(
+        `Gemini ${currentModel} returned empty output (finishReason=${finishReason}` +
+        `${blockReason ? `, blockReason=${blockReason}` : ''}, thoughts=${thoughts})`
+      );
+      lastError.code = 'EMPTY_OUTPUT';
+      console.warn(`[gemini] ${lastError.message}; trying next model...`);
+      continue;
     }
 
     const detail = await response.text();
     lastError = new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`);
+    lastError.status = response.status;
     if (response.status === 404 || response.status === 400) {
       console.warn(`[gemini] model ${currentModel} returned ${response.status}, trying fallback model...`);
       continue;
@@ -814,38 +870,113 @@ function parseTranslationJson(value) {
   return loose.size ? loose : null;
 }
 
+async function translateEntriesWithGemini(sourceEntries, systemText, label) {
+  const userText = buildTranslationUserText(sourceEntries);
+  const maxOutputTokens = computeTranslationMaxOutputTokens(sourceEntries.length);
+  const response = await translateWithGemini(systemText, userText, { maxOutputTokens });
+  const translated = parseTranslationJson(response) || new Map();
+
+  let missing = sourceEntries.filter(entry => !translated.has(String(entry.id)));
+  if (missing.length) {
+    console.warn(`[translation] ${label} incomplete (${sourceEntries.length - missing.length}/${sourceEntries.length}); repairing ${missing.length} missing cue(s)`);
+    try {
+      const repairUser = `${buildTranslationUserText(missing)}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once in JSON {"translations":[{"id":"...","text":"..."}]}.`;
+      const repaired = await translateWithGemini(systemText, repairUser, {
+        maxOutputTokens: computeTranslationMaxOutputTokens(missing.length)
+      });
+      const repairedMap = parseTranslationJson(repaired);
+      if (repairedMap) {
+        for (const entry of missing) {
+          const text = repairedMap.get(String(entry.id));
+          if (typeof text === 'string' && text.trim()) translated.set(String(entry.id), text.trim());
+        }
+      }
+    } catch (error) {
+      console.warn(`[translation] ${label} repair failed: ${error.message}`);
+      if (error.code !== 'EMPTY_OUTPUT' && error.code !== 'INCOMPLETE') throw error;
+    }
+    missing = sourceEntries.filter(entry => !translated.has(String(entry.id)));
+  }
+
+  if (missing.length) {
+    const error = new Error(`${label} still incomplete after repair (${sourceEntries.length - missing.length}/${sourceEntries.length})`);
+    error.code = 'INCOMPLETE';
+    error.partialTranslations = translated;
+    error.missingEntries = missing;
+    throw error;
+  }
+
+  return sourceEntries.map(entry => ({
+    id: entry.id,
+    timecode: entry.timecode,
+    text: translated.get(String(entry.id))
+  }));
+}
+
+async function translateChunkEntries(entries, systemText, label, depth = 0) {
+  try {
+    return await translateEntriesWithGemini(entries, systemText, label);
+  } catch (error) {
+    if (error.code !== 'INCOMPLETE' && error.code !== 'EMPTY_OUTPUT') throw error;
+
+    const partial = error.partialTranslations instanceof Map ? error.partialTranslations : new Map();
+    const missing = Array.isArray(error.missingEntries)
+      ? error.missingEntries
+      : entries.filter(entry => !partial.has(String(entry.id)));
+
+    // Če je večina cue-jev prevedenih in manjka le nekaj, poskusi samo manjkajoče.
+    if (missing.length > 0 && missing.length < entries.length) {
+      console.warn(`[translation] ${label}: retrying only ${missing.length} missing cue(s)`);
+      try {
+        const missingTranslated = await translateChunkEntries(missing, systemText, `${label} [missing]`, depth + 1);
+        for (const entry of missingTranslated) partial.set(String(entry.id), entry.text);
+        return entries.map(entry => ({
+          id: entry.id,
+          timecode: entry.timecode,
+          text: partial.get(String(entry.id)) || entry.text
+        }));
+      } catch (innerError) {
+        if (innerError.code !== 'INCOMPLETE' && innerError.code !== 'EMPTY_OUTPUT') throw innerError;
+      }
+    }
+
+    // Zadnja varovalka: namesto da odpove celoten film, ohrani izvorno besedilo
+    // za ta majhen del in nadaljuj. Napaka je jasno zabeležena v logu.
+    if (entries.length <= MIN_SPLIT_CHUNK_SIZE || depth >= MAX_SPLIT_DEPTH) {
+      console.warn(`[translation] ${label}: ${missing.length}/${entries.length} cue(s) kept in source language after repeated AI failures`);
+      return entries.map(entry => ({
+        id: entry.id,
+        timecode: entry.timecode,
+        text: partial.get(String(entry.id)) || entry.text
+      }));
+    }
+
+    const mid = Math.ceil(entries.length / 2);
+    console.warn(`[translation] ${label}: splitting ${entries.length} cues into ${mid}+${entries.length - mid} after: ${error.message}`);
+    const left = await translateChunkEntries(entries.slice(0, mid), systemText, `${label} [1/2]`, depth + 1);
+    const right = await translateChunkEntries(entries.slice(mid), systemText, `${label} [2/2]`, depth + 1);
+    return [...left, ...right];
+  }
+}
+
 async function translateChunk(chunk, context) {
   const sourceEntries = chunk.entries || parseSrt(chunk.srt);
   const systemText = systemPrompt(context);
-  const userText = buildTranslationUserText(sourceEntries);
+  const label = `chunk ${chunk.index + 1}`;
 
-  const response = await translateWithGemini(systemText, userText);
-  let translated = parseTranslationJson(response);
-
-  if (!translated || translated.size !== sourceEntries.length) {
-    console.warn(`[translation] chunk ${chunk.index + 1} incomplete (${translated?.size || 0}/${sourceEntries.length}); repairing`);
-    const repairUser = `${userText}\n\nREPAIR: your previous reply was missing or malformed entries. Return every source id exactly once in JSON {"translations":[{"id":"...","text":"..."}]}.`;
-    const repaired = await translateWithGemini(systemText, repairUser);
-    translated = parseTranslationJson(repaired) || translated || new Map();
-
-    if (translated.size !== sourceEntries.length) {
-      throw new Error(`chunk ${chunk.index + 1} still incomplete after repair (${translated.size}/${sourceEntries.length})`);
-    }
-  }
-
-  let resultEntries = sourceEntries.map(entry => ({
-    id: entry.id,
-    timecode: entry.timecode,
-    text: translated.get(String(entry.id)) || entry.text
-  }));
+  // Vsak chunk se ob napaki samodejno razdeli na manjše dele, zato en slab
+  // odgovor modela ne pomeni več, da celoten film ostane nepreveden.
+  let resultEntries = await translateChunkEntries(sourceEntries, systemText, label);
 
   const tooFast = findTooFastCues(resultEntries);
   if (tooFast.length) {
-    console.warn(`[translation] chunk ${chunk.index + 1}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
+    console.warn(`[translation] ${label}: ${tooFast.length} cue(s) over reading-speed budget, shortening`);
     const shortenNote = 'SHORTENING PASS: the cues below are too long for their on-screen duration. Rewrite ONLY these cues to fit within max_chars and max 2 lines while preserving meaning and correct gender. Return JSON {"translations":[{"id":"...","text":"..."}]}.';
     const shortenUserText = tooFast.map(c => `[id=${c.id} max_chars=${c.budget}] ${c.text.replace(/\n/g, ' / ')}`).join('\n');
     try {
-      const shortenedRaw = await translateWithGemini(systemText, `${shortenNote}\n\n${shortenUserText}`);
+      const shortenedRaw = await translateWithGemini(systemText, `${shortenNote}\n\n${shortenUserText}`, {
+        maxOutputTokens: computeTranslationMaxOutputTokens(tooFast.length)
+      });
       const shortenedMap = parseTranslationJson(shortenedRaw);
       if (shortenedMap) {
         resultEntries = resultEntries.map(entry => shortenedMap.has(String(entry.id)) ? { ...entry, text: shortenedMap.get(String(entry.id)) } : entry);
@@ -1436,6 +1567,7 @@ module.exports = {
   GEMINI_MODEL,
   providerConfig,
   buildGeminiRequest,
+  computeTranslationMaxOutputTokens,
   translateWithGemini,
   extractGeminiOutputText,
   buildClaudeRequest,
@@ -1476,6 +1608,7 @@ module.exports = {
   ensureKeepAlive,
   parseTranslationJson,
   extractTranslationPairsLoosely,
+  translateChunk,
   friendlyErrorMessage,
   statusNoticeSrt,
   buildCacheKey,
