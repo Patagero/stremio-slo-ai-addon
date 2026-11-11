@@ -10,7 +10,9 @@ services:
       - key: PORT
         value: 7002
       - key: GEMINI_MODEL
-        value: gemini-3.1-pro-preview
+        value: gemini-3.1-flash-lite
+      - key: ANALYSIS_MODEL
+        value: gemini-3.6-flash
       - key: GEMINI_API_KEY
         sync: false
       - key: PUBLIC_BASE_URL

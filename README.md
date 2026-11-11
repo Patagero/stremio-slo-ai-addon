@@ -1,6 +1,6 @@
-# Slo AI Subtitle Translator (Gemini 3.1 Pro & Whisper)
+# Slo AI Subtitle Translator (Gemini Flash)
 
-Stremio addon za vrhunske slovenske podnapise s samodejno izbiro vira (Prioriteta: HR -> IT -> EN) ter Whisper zvočnim virom, poganjano z Google Gemini 3.1 Pro (`gemini-3.1-pro-preview`).
+Stremio addon za vrhunske slovenske podnapise s samodejno izbiro vira (Prioriteta: HR -> IT -> EN) ter Whisper zvočnim virom, poganjano z Google Gemini: prevaja cenejši `gemini-3.1-flash-lite`, like in njihov spol pa enkrat na film določi močnejši `gemini-3.6-flash` (če model pri Googlu ni na voljo, se samodejno uporabi naslednji).
 
 ## Glavne funkcionalnosti
 
@@ -15,8 +15,8 @@ Stremio addon za vrhunske slovenske podnapise s samodejno izbiro vira (Prioritet
    - Samodejno odstrani opise zvokov (`[Music]`, `[Laughs]`, `*gasp*`, `(laughter)`, `♪...♪`) in oznake govorcev (`JOHN:`).
    - Ohrani izključno čisto besedilo dialogov ter nedotaknjeno SRT strukturo (številke in časovne žige).
 
-3. **Vrhunski prevod z Gemini 3.1 Pro (`gemini-3.1-pro-preview`)**:
-   - **Spolno ujemanje (ona/on)**: Natančna analiza spolov likov iz dialoga in TMDB podatkov ter glagolskih oblik (npr. *rekla sem* / *rekel sem*).
+3. **Vrhunski prevod z Gemini Flash**:
+   - **Spolno ujemanje (ona/on)**: spol se določa iz več virov — TMDB zasedba (lik -> spol igralca, pri serijah tudi gostujoči igralci epizode), SDH oznake govorcev v izvirniku (`JOHN:`), slovnične končnice hrvaškega/italijanskega izvirnika (*rekla sam*), AI analiza likov celotnega dialoga (imena, vzdevki, zaimki, sorodstvo) in kontekst prejšnjih podnapisov. Model za vsak podnapis najprej določi spol govorca in nagovorjenega, šele nato prevede (*rekla sem* / *rekel sem*, *Kje si bila?* / *Kje si bil?*).
    - **Omejitev vrstic**: Vsak podnapis (cue) je razdeljen na **največ 2 kratki vrstici** (do 42 znakov), prilagojeni za udobno branje na zaslonu (17 CPS).
    - **Naraven pogovorni jezik**: Tekoča, idiomatska slovenščina brez dobesednih prevodov.
    - **Tehnična integriteta**: Točno ohranjeni časovni žigi in številke podnapisov.
@@ -41,7 +41,8 @@ Povezava za Stremio:
 
 V Renderju nastavite okoljske spremenljivke:
 - `GEMINI_API_KEY` (vaš Gemini API ključ)
-- `GEMINI_MODEL` (privzeto `gemini-3.1-pro-preview`)
+- `GEMINI_MODEL` (model za prevajanje, privzeto `gemini-3.1-flash-lite`)
+- `ANALYSIS_MODEL` (model za analizo likov in spolov, privzeto `gemini-3.6-flash`)
 - `TMDB_API_KEY` (brezplačni ključ na themoviedb.org)
 - `OPENSUBTITLES_API_KEY` (OpenSubtitles REST API ključ)
 - `PUBLIC_BASE_URL` (npr. `https://stremio-slo-ai-addon.onrender.com`)

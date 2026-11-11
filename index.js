@@ -35,18 +35,31 @@ const CACHE_DIR = process.env.CACHE_DIR || path.join(__dirname, '.cache');
 
 // Google Gemini Flash konfiguracija (optimiziran model, 15x ceneje, bliskovito hitro)
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || GEMINI_MODEL;
+// Dva modela, da je cena nizka in spol vseeno zanesljiv:
+// - GEMINI_MODEL prevaja vse podnapise (veliko klicev) -> najcenejši primeren model
+//   gemini-3.1-flash-lite (0,25 $ vhod / 1,50 $ izhod na milijon žetonov).
+// - ANALYSIS_MODEL enkrat na film določi like in njihov spol (en klic) -> močnejši
+//   gemini-3.6-flash, ker se na ta seznam opira ves prevod.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gemini-3.6-flash';
 const providerConfig = { name: 'gemini', model: GEMINI_MODEL };
 
-const GEMINI_FALLBACK_MODELS = [
-  GEMINI_MODEL,
-  'gemini-2.5-flash',
-  'gemini-3.7-flash',
-  'gemini-2.0-flash',
-  'gemini-3.1-pro-preview',
-  'gemini-2.5-pro',
-];
+// Če izbrani model pri Googlu ni (več) na voljo (HTTP 404) ali vrne prazen
+// odgovor, se uporabi naslednji s seznama: cenejši model najprej poskusi cenejše
+// zamenjave, močnejši najprej močnejše. Nedosegljiv model si zapomnimo, da ne
+// zapravljamo zahtevka pri vsakem chunku.
+const GEMINI_LITE_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+const GEMINI_FULL_MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash'];
+const unavailableGeminiModels = new Set();
+
+function geminiModelsToTry(requestedModel) {
+  const order = /lite/i.test(requestedModel)
+    ? [...GEMINI_LITE_MODELS, ...GEMINI_FULL_MODELS]
+    : [...GEMINI_FULL_MODELS, ...GEMINI_LITE_MODELS];
+  const all = [requestedModel, ...order, GEMINI_MODEL].filter((model, index, list) => list.indexOf(model) === index);
+  const reachable = all.filter(model => !unavailableGeminiModels.has(model));
+  return reachable.length ? reachable : all;
+}
 
 // Gemini 3.x privzeto vklopi "thinking", ki porabi isti proračun kot izhod.
 // Pri prevajanju podnapisov to povzroči prazne odgovore (MAX_TOKENS), zato
@@ -62,6 +75,9 @@ const GEMINI_SAFETY_SETTINGS = [
 ];
 
 // Ciljna hitrost branja (characters per second) in omejitev vrstic
+// Koliko cue-jev prejšnjega chunka dobi model kot kontekst (kdo govori in komu).
+const CONTEXT_CUES = Math.max(0, Math.min(20, Number(process.env.CONTEXT_CUES || 8)));
+
 const TARGET_CPS = Number(process.env.TARGET_CPS || 17);
 const MAX_LINE_CHARS = Number(process.env.MAX_LINE_CHARS || 42);
 const MAX_LINES = 2;
@@ -280,23 +296,30 @@ function removeSdhEntries(srtText, characterMap = new Map()) {
 
   for (const entry of parsed) {
     const rawLines = entry.text.split('\n');
-    let detectedSpeaker = null;
-    let detectedGender = null;
 
-    for (const line of rawLines) {
-      if (!detectedSpeaker) detectedSpeaker = extractSpeakerFromRawText(line);
-      if (!detectedGender) detectedGender = detectGenderFromDialogue(line);
+    // Spol določimo za vsako vrstico posebej: ime govorca iz SDH oznake ("ANA:")
+    // ima prednost (TMDB / analiza likov), sicer slovnične končnice izvirnika.
+    const lineInfo = rawLines
+      .map(line => {
+        const speaker = extractSpeakerFromRawText(line);
+        const gender = lookupCharacterGender(characterMap, speaker) || detectGenderFromDialogue(line);
+        return { text: stripSdhFromLine(line), gender, startsTurn: /^\s*[-–—]/.test(line) || Boolean(speaker) };
+      })
+      .filter(info => info.text);
+    if (!lineInfo.length) continue;
+    const cleanedLines = lineInfo.map(info => info.text);
+
+    // Cue z dvema govorcema ("- ...\n- ..."): vsak govorec dobi svojo oznako.
+    const isTwoSpeakerCue = lineInfo.length === 2 && lineInfo.every(info => info.startsTurn);
+    let genderTag = '';
+    if (isTwoSpeakerCue) {
+      if (lineInfo.some(info => info.gender)) {
+        genderTag = `[Govorec 1: ${lineInfo[0].gender || 'neznan'}; Govorec 2: ${lineInfo[1].gender || 'neznan'}]`;
+      }
+    } else {
+      const detectedGender = lineInfo.map(info => info.gender).find(Boolean);
+      if (detectedGender) genderTag = `[Govorec: ${detectedGender}]`;
     }
-
-    if (detectedSpeaker && characterMap && characterMap.has(detectedSpeaker.toLowerCase())) {
-      const g = characterMap.get(detectedSpeaker.toLowerCase());
-      if (g) detectedGender = g;
-    }
-
-    const cleanedLines = rawLines.map(stripSdhFromLine).filter(Boolean);
-    if (!cleanedLines.length) continue;
-
-    const genderTag = detectedGender ? `[Govorec: ${detectedGender}]` : '';
 
     entries.push({
       ...entry,
@@ -384,7 +407,16 @@ function findTooFastCues(entries) {
 
 // ---------- Metadata (TMDB) ----------
 
-async function tmdbMetadata(imdbId) {
+function tmdbCastToCredits(cast) {
+  return (cast || []).map(c => ({
+    name: c.character ? `${c.character} (${c.name})` : c.name,
+    character: c.character || '',
+    actor: c.name || '',
+    gender: c.gender
+  }));
+}
+
+async function tmdbMetadata(imdbId, season, episode) {
   if (!process.env.TMDB_API_KEY) return { title: imdbId, overview: 'Not provided', genres: [], credits: [], originalLanguage: null };
   const base = 'https://api.themoviedb.org/3';
   const find = await axios.get(`${base}/find/${encodeURIComponent(imdbId)}`, {
@@ -396,16 +428,111 @@ async function tmdbMetadata(imdbId) {
   const details = await axios.get(`${base}/${type}/${item.id}`, {
     params: { api_key: process.env.TMDB_API_KEY, language: 'en-US', append_to_response: 'credits' }
   });
+  let cast = (details.data.credits?.cast || []).slice(0, 40);
+
+  // Pri serijah dodamo še gostujoče igralce točno te epizode — ti v splošnem
+  // seznamu serije manjkajo, v dialogu epizode pa pogosto govorijo.
+  if (type === 'tv' && season && episode) {
+    try {
+      const ep = await axios.get(`${base}/tv/${item.id}/season/${season}/episode/${episode}/credits`, {
+        params: { api_key: process.env.TMDB_API_KEY, language: 'en-US' }
+      });
+      const seen = new Set(cast.map(c => c.id));
+      const extra = [...(ep.data.cast || []), ...(ep.data.guest_stars || [])].filter(c => !seen.has(c.id));
+      cast = [...cast, ...extra].slice(0, 60);
+    } catch (error) {
+      console.warn(`[tmdb] episode credits failed for ${imdbId} S${season}E${episode}: ${error.message}`);
+    }
+  }
+
   return {
     title: details.data.title || details.data.name || imdbId,
     overview: details.data.overview || 'Not provided',
     genres: (details.data.genres || []).map(g => g.name),
     originalLanguage: details.data.original_language || null,
-    credits: (details.data.credits?.cast || []).slice(0, 20).map(c => ({
-      name: c.character ? `${c.character} (${c.name})` : c.name,
-      gender: c.gender
-    }))
+    credits: tmdbCastToCredits(cast)
   };
+}
+
+// ---------- Zemljevid ime lika -> spol (TMDB + analiza dialoga) ----------
+
+const NAME_STOPWORDS = new Set([
+  'the', 'and', 'von', 'van', 'del', 'der', 'voice', 'uncredited', 'young', 'old', 'self',
+  'mr', 'mrs', 'ms', 'miss', 'dr', 'sir', 'lady', 'lord', 'agent', 'officer', 'detective',
+  'captain', 'sergeant', 'doctor', 'professor', 'father', 'mother', 'man', 'woman', 'boy', 'girl'
+]);
+
+function normalizeName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/["'’`.]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Vrne Map: normalizirano ime (polno ime, vzdevek, ime, priimek) -> 'Ženska' | 'Moški'.
+// Ključ, ki bi kazal na lika različnih spolov (npr. skupni priimek), se zavrže.
+function buildCharacterGenderMap(meta = {}, ledger = []) {
+  const map = new Map();
+  const conflicted = new Set();
+  const strong = new Set();
+
+  const add = (key, gender, isStrong) => {
+    if (!key || key.length < 2 || conflicted.has(key)) return;
+    if (strong.has(key) && !isStrong) return;
+    if (map.has(key) && map.get(key) !== gender) {
+      if (isStrong && !strong.has(key)) {
+        map.set(key, gender);
+        strong.add(key);
+        return;
+      }
+      map.delete(key);
+      conflicted.add(key);
+      return;
+    }
+    map.set(key, gender);
+    if (isStrong) strong.add(key);
+  };
+
+  const addCharacter = (rawName, gender, isStrong) => {
+    // TMDB zapisuje vzdevke kot "Tony Stark / Iron Man".
+    for (const alias of String(rawName || '').split(/\s*\/\s*|\s+aka\s+/i)) {
+      const full = normalizeName(alias);
+      if (!full) continue;
+      add(full, gender, isStrong);
+      const tokens = full.split(' ').filter(t => t.length >= 3 && !NAME_STOPWORDS.has(t));
+      if (tokens.length > 1) for (const token of tokens) add(token, gender, isStrong);
+    }
+  };
+
+  // Pri animaciji ženske pogosto posodijo glas dečkom, zato tam bolj zaupamo dialogu.
+  const isAnimation = (meta.genres || []).some(g => /animation/i.test(g));
+  const tmdbEntries = (meta.credits || [])
+    .map(c => ({ name: c.character || c.name, gender: c.gender === 1 ? 'Ženska' : (c.gender === 2 ? 'Moški' : null) }))
+    .filter(c => c.name && c.gender);
+  const ledgerEntries = (ledger || [])
+    .map(c => ({
+      names: [c.name, ...(Array.isArray(c.aliases) ? c.aliases : [])],
+      gender: c.gender === 'female' ? 'Ženska' : (c.gender === 'male' ? 'Moški' : null),
+      confident: c.confidence === 'high'
+    }))
+    .filter(c => c.gender);
+
+  for (const c of tmdbEntries) addCharacter(c.name, c.gender, !isAnimation);
+  for (const c of ledgerEntries) {
+    for (const name of c.names) addCharacter(name, c.gender, isAnimation && c.confident);
+  }
+  return map;
+}
+
+function lookupCharacterGender(characterMap, speaker) {
+  if (!characterMap || !speaker) return null;
+  const full = normalizeName(speaker);
+  if (characterMap.has(full)) return characterMap.get(full);
+  const tokens = full.split(' ').filter(t => t.length >= 3 && !NAME_STOPWORDS.has(t));
+  const hits = new Set(tokens.map(t => characterMap.get(t)).filter(Boolean));
+  return hits.size === 1 ? [...hits][0] : null;
 }
 
 function buildMetadataContext(meta = {}) {
@@ -562,7 +689,7 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
   throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
 }
 
-// ---------- 3. VRHUNSKI PREVOD Z GEMINI 3.1 PRO ----------
+// ---------- 3. VRHUNSKI PREVOD Z GEMINI ----------
 
 function buildGeminiGenerationConfig(model, options = {}) {
   const generationConfig = {
@@ -574,7 +701,10 @@ function buildGeminiGenerationConfig(model, options = {}) {
     generationConfig.temperature = 0.2;
   }
   if (options.maxOutputTokens) {
-    generationConfig.maxOutputTokens = options.maxOutputTokens;
+    // Gemini 1.5 in 2.0 dovolita največ 8192 izhodnih žetonov.
+    generationConfig.maxOutputTokens = /^gemini-(?:1\.5|2\.0)/i.test(model)
+      ? Math.min(8192, options.maxOutputTokens)
+      : options.maxOutputTokens;
   }
 
   // Gemini 3.x uporablja thinkingLevel, Gemini 2.5 pa thinkingBudget.
@@ -605,7 +735,8 @@ function buildGeminiRequest(systemText, userText, model = GEMINI_MODEL, options 
 
 function computeTranslationMaxOutputTokens(entryCount) {
   const count = Math.max(1, Number(entryCount) || 1);
-  return Math.max(4096, Math.min(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, count * 96));
+  // 112 žetonov na cue: prevod + polji spola ("g", "a") + rezerva za razmišljanje.
+  return Math.max(4096, Math.min(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, count * 112));
 }
 
 function extractGeminiOutputText(data) {
@@ -619,7 +750,7 @@ async function translateWithGemini(systemText, userText, options = {}) {
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
 
   const requestedModel = options.model || GEMINI_MODEL;
-  const modelsToTry = [requestedModel, ...GEMINI_FALLBACK_MODELS.filter(m => m !== requestedModel)];
+  const modelsToTry = geminiModelsToTry(requestedModel);
   let lastError = null;
 
   for (const currentModel of modelsToTry) {
@@ -654,6 +785,7 @@ async function translateWithGemini(systemText, userText, options = {}) {
     lastError = new Error(`Gemini HTTP ${response.status}: ${detail.slice(0, 300)}`);
     lastError.status = response.status;
     if (response.status === 404 || response.status === 400) {
+      if (response.status === 404 && fetchImpl === fetch) unavailableGeminiModels.add(currentModel);
       console.warn(`[gemini] model ${currentModel} returned ${response.status}, trying fallback model...`);
       continue;
     }
@@ -673,13 +805,19 @@ const extractClaudeOutputText = (data) => extractGeminiOutputText(data) || (data
 // ---------- Pass 1: Analiza likov in spolov (Character Ledger) ----------
 
 function characterAnalysisPrompt(tmdbContext) {
-  return `You are preparing a character-gender reference sheet ("ledger") for a professional subtitle translation into Slovenian using Gemini 3.1 Pro.
+  return `You are preparing a character-gender reference sheet ("ledger") for a professional subtitle translation into Slovenian. Slovenian marks gender on past-tense verbs and adjectives for the speaker, the person addressed and anyone mentioned, so this sheet decides whether the translation says "rekla" or "rekel".
 
 TASK:
-1. Identify every named or clearly identifiable character who speaks or is addressed.
-2. Determine each character's gender using: dialogue context, verb agreements in source language (Croatian and Italian explicitly mark feminine past tense verbs like "rekla sam", "bila sam", "sono andata"), and the TMDB cast list.
-3. Mark gender as "male", "female", or "unknown".
-4. Return ONLY valid JSON: {"characters":[{"name":"Character Name","gender":"male|female|unknown","confidence":"high|medium|low","note":"clue"}]}
+1. Identify every named or clearly identifiable character who speaks, is addressed or is talked about — including minor ones and those known only by a role ("Mom", "the nurse", "Captain").
+2. Determine each character's gender. Evidence, strongest first:
+   a. The TMDB cast list below (the actor's gender is the character's gender; for animation trust the dialogue over the voice actor).
+   b. Verb and adjective agreement in the source language (Croatian and Italian explicitly mark feminine past tense verbs like "rekla sam", "bila sam", "sono andata").
+   c. Pronouns and kinship/address words used about or to the character (he/she, his/her, sir/ma'am, Mr/Mrs, brother/sister, son/daughter, husband/wife, gospodine/gospođo, signore/signora).
+   d. The given name itself — only as weak evidence (confidence "low").
+3. List every other name the same character goes by (first name, surname, nickname, title) in "aliases".
+4. Mark gender as "male", "female", or "unknown". Never guess: with no real evidence use "unknown".
+5. In "note" give the role/relationship and the clue in a few words (e.g. "Ana's husband; 'rekao sam'").
+6. Return ONLY valid JSON: {"characters":[{"name":"Character Name","aliases":["Other Name"],"gender":"male|female|unknown","confidence":"high|medium|low","note":"clue"}]}
 
 TMDB CAST METADATA:
 ${tmdbContext}`;
@@ -697,7 +835,8 @@ function parseCharacterLedger(raw) {
       .filter(c => c && typeof c.name === 'string' && c.name.trim())
       .map(c => ({
         name: c.name.trim(),
-        gender: ['male', 'female', 'unknown'].includes(c.gender) ? c.gender : 'unknown',
+        aliases: Array.isArray(c.aliases) ? c.aliases.filter(a => typeof a === 'string' && a.trim()).map(a => a.trim()) : [],
+        gender: ['male', 'female', 'unknown'].includes(String(c.gender).toLowerCase()) ? String(c.gender).toLowerCase() : 'unknown',
         confidence: c.confidence || 'low',
         note: c.note || ''
       }));
@@ -709,7 +848,7 @@ function parseCharacterLedger(raw) {
 function ledgerToText(characters) {
   if (!characters.length) return 'No characters could be reliably identified from the dialogue; rely on TMDB cast metadata above.';
   return characters
-    .map(c => `${c.name}: ${c.gender}${c.note ? ` (${c.note})` : ''} [confidence: ${c.confidence}]`)
+    .map(c => `${c.name}${c.aliases?.length ? ` (also: ${c.aliases.join(', ')})` : ''}: ${c.gender}${c.note ? ` (${c.note})` : ''} [confidence: ${c.confidence}]`)
     .join('\n');
 }
 
@@ -735,7 +874,8 @@ const CHARACTER_LEDGER_SCHEMA = {
 
 async function analyzeCharacters(sourceSrt, meta) {
   const entries = parseSrt(sourceSrt);
-  const dialogue = entries.map(e => e.text.replace(/\n/g, ' ')).join('\n');
+  // SDH oznake govorcev ("ANA:") namenoma ostanejo — so najboljši namig za spol.
+  const dialogue = entries.map(e => e.text.replace(/\n/g, ' / ')).join('\n');
   const tmdbContext = buildMetadataContext(meta);
   const systemText = characterAnalysisPrompt(tmdbContext);
   const userText = `Dialogue to analyze:\n${dialogue}\n\nReturn JSON only.`;
@@ -751,7 +891,7 @@ async function analyzeCharacters(sourceSrt, meta) {
 // ---------- Pass 2: Vrhunski prevod v slovenščino ----------
 
 function systemPrompt(context) {
-  return `You are an elite, professional film subtitle translator specializing in Croatian/Italian/English to natural, idiomatic Slovenian translation (powered by Gemini 3.1 Pro).
+  return `You are an elite, professional film subtitle translator specializing in Croatian/Italian/English to natural, idiomatic Slovenian translation.
 
 CONTEXT:
 ${context}
@@ -763,9 +903,25 @@ CORE TRANSLATION & SUBTITLING RULES:
 - BREZPOGOJNO upoštevaj te dodeljene oznake spola za vsako posamezno vrstico pri izbiri glagolskih oblik, pridevnikov in zaimkov!
 - ŽENSKA ([Govorec: Ženska]): obvezno uporabi ženske oblike glagolov v pretekliku ("rekla sem", "prišla sem", "bila sem", "videla sem", "si videla?", "si pripravljena?"), ženske pridevnike ("sama", "vesela", "utrujena", "hvaležna") in ustrezne ženske zaimke.
 - MOŠKI ([Govorec: Moški]): obvezno uporabi moške oblike ("rekel sem", "prišel sem", "bil sem", "videl sem", "si videl?", "si pripravljen?", "sam", "vesel").
+- Oznaka [Govorec 1: ...; Govorec 2: ...] pomeni cue z dvema govorcema: prva vrstica pripada prvemu, druga drugemu.
 - V hrvaščini in italijanščini dodatno izkoristi očitne spolne končnice izvirnika ("rekla sam" -> "rekla sem", "sono andata" -> "šla sem").
 - Pravilno uporabljaj slovensko dvojino (npr. "greva", "bova videla/videli").
 - POMEMBNO: Tehničnih oznak [Govorec: ...] NIKOLI ne vključuj v končno besedilo prevoda!
+
+1a. TRIJE SPOLI V VSAKEM STAVKU — GOVOREC, NAGOVORJENI, OMENJENI:
+Slovenščina označi spol pri treh različnih osebah. Za vsak cue preveri vse tri:
+- GOVOREC (1. oseba): "utrujena sem" / "utrujen sem". Vir: oznaka [Govorec: ...], sicer kdo v prizoru govori.
+- NAGOVORJENI (2. oseba): "Kje si bila?" (ženski) / "Kje si bil?" (moškemu); "Si nora?" / "Si nor?". Spol nagovorjenega NI spol govorca! Ugotovi ga iz imena v nagovoru ("Ana, ..."), iz tega, kdo je govoril tik pred tem in komu odgovarja, ter iz CHARACTER LEDGER.
+- OMENJENI (3. oseba): "Marko je odšel" / "Ana je odšla"; "he/she", "his/her" -> "on/ona", "njegov/njen". Spol poišči po imenu v CHARACTER LEDGER in TMDB Cast Genders.
+- Angleščina spola ne kaže ("I was tired", "Were you there?", "They left"), zato ga pri angleškem viru VEDNO določi iz konteksta, nikoli po privzeti moški obliki.
+- Sledi poteku pogovora: v dialogu se govorca izmenjujeta; pomišljaj "-" na začetku vrstice pomeni menjavo govorca. Kdor je vprašan, praviloma odgovarja v naslednjem cue-ju.
+- Bodi dosleden: ista oseba ima isti spol skozi ves film. Ko enkrat ugotoviš spol lika, ga ne spreminjaj.
+
+1b. ŠTEVILO IN SPOL SKUPINE:
+- Dve osebi -> dvojina: moški + moški ali mešan par "sva šla", "sta bila"; dve ženski "sva šli", "sta bili".
+- Tri ali več oseb -> množina: mešana ali moška skupina "smo šli", samo ženske "smo šle".
+- Angleški "you" je lahko ednina, dvojina ("vidva/vidve") ali množina ("vi") — odloči se po tem, koliko oseb je nagovorjenih.
+- Pri vikanju je deležnik v moški množini ne glede na spol: "Gospa, kje ste bili?".
 
 2. ŽANRSKO PRILAGOJEN SLENG, KLETVICE IN NARAVNI FILMSKI IDIOM:
 - Akcija / Kriminalka / Triler: Uporabljaj surov, naraven filmski pogovorni jezik, ulični sleng in pristne slovenske kletvice ("fak", "daj no", "stari", "mater", "k vragu", "kaj dogaja", "gremo"). Brez zastarelih ali prisiljenih knjižnih izrazov.
@@ -780,7 +936,8 @@ CORE TRANSLATION & SUBTITLING RULES:
 - Strni predolgo besedilo: izpusti odvečna mašila in ponavljanja ter ohrani bistvo in ton dialoga.
 
 4. VARNOSTNO PRAVILO ZA SPOL (FALLBACK NA NEVTRALNOST):
-- Če pri določenem stavku ali dialogu nisi 100-odstotno prepričan o spolu govorca (ker kontekst ni jasen ali ni zvočne/tekstovne oznake), se STROGO IZOGNI izpostavljanju spola.
+- Najprej izčrpaj vse vire po vrsti: (1) oznaka [Govorec: ...], (2) spolne končnice izvirnika, (3) ime lika v CHARACTER LEDGER / TMDB Cast Genders, (4) potek pogovora in prejšnji cue-ji. Šele če nobeden ne da odgovora, uporabi nevtralno obliko.
+- Če pri določenem stavku ali dialogu nisi 100-odstotno prepričan o spolu govorca, nagovorjenega ali omenjenega (ker kontekst ni jasen ali ni zvočne/tekstovne oznake), se STROGO IZOGNI izpostavljanju spola.
 - V takih primerih kreativno obrni stavek, spremeni strukturo ali uporabi nevtralen izraz, ki spola neizogibno ne izdaja (npr. sedanji čas, brezoosebna oblika, preoblikovan stavek, "treba je", "ravnokar prihajam", "kaj se je zgodilo?"), da preprečiš slovnično napačno spolno ujemanje.
 
 5. NARAVEN POGOVORNI JEZIK:
@@ -789,21 +946,34 @@ CORE TRANSLATION & SUBTITLING RULES:
 
 6. POPOLNA TEHNIČNA INTEGRITETA SRT:
 - Ohraniti moraš točne ID številke vseh podnapisov.
-- Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","text":"Prva vrstica\\nDruga vrstica"}]}`;
+- Cue-ji pod "PREJŠNJI CUE-JI" so samo kontekst — NE prevajaj jih in jih NE vračaj.
+- Za vsak cue NAJPREJ določi spol in ga zapiši, ŠELE NATO napiši prevod, ki se s tem ujema:
+  "g" = spol govorca: "F" (ženska), "M" (moški), "FM" (dva govorca v cue-ju), "?" (neznan -> nevtralna oblika).
+  "a" = spol nagovorjenega: "F", "M", "P" (več oseb ali vikanje), "?" (neznan ali nihče ni nagovorjen).
+- Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","g":"F","a":"M","text":"Prva vrstica\\nDruga vrstica"}]}`;
 }
 
-function buildTranslationUserText(sourceEntries) {
+function buildTranslationUserText(sourceEntries, previousEntries = []) {
   const lines = sourceEntries.map(entry => {
     const duration = cueDurationSeconds(entry).toFixed(1);
     const budget = maxCharsForDuration(cueDurationSeconds(entry));
     const tag = entry.genderTag ? `${entry.genderTag} ` : '';
     return `[id=${entry.id} duration=${duration}s max_chars=${budget}] ${tag}${entry.text.replace(/\n/g, ' / ')}`;
   });
+  // Kontekstni cue-ji namenoma nimajo oblike "[id=...]", da jih model ne vrača.
+  const previous = (previousEntries || []).map(entry => {
+    const tag = entry.genderTag ? `${entry.genderTag} ` : '';
+    return `(prej) ${tag}${entry.text.replace(/\n/g, ' / ')}`;
+  });
+  const previousBlock = previous.length
+    ? `PREJŠNJI CUE-JI (samo kontekst za to, kdo govori in komu — NE prevajaj, NE vračaj):\n${previous.join('\n')}\n\n`
+    : '';
   return `Prevedi vsak cue v naravno slovenščino (max 2 vrstici na cue, strogo upoštevaj označeni spol govorca [Govorec: ...]).
+Pri vsakem cue-ju najprej določi spol govorca ("g") in nagovorjenega ("a"), nato napiši prevod, ki se z njima ujema.
 V izhodu NE vključuj tehničnih oznak [Govorec: ...], ampak samo čist slovenski dialog.
-Return JSON: {"translations": [{"id": "...", "text": "..."}]}
+Return JSON: {"translations": [{"id": "...", "g": "F|M|FM|?", "a": "F|M|P|?", "text": "..."}]}
 
-SOURCE CUES:
+${previousBlock}SOURCE CUES:
 ${lines.join('\n')}`;
 }
 
@@ -832,7 +1002,8 @@ const TRANSLATION_SCHEMA = buildTranslationSchema(undefined);
 
 function extractTranslationPairsLoosely(text) {
   const map = new Map();
-  const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  // Med "id" in "text" sta lahko kratki polji spola ("g", "a").
+  const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,(?:\s*"[a-z]{1,3}"\s*:\s*"[^"\n]{0,8}"\s*,)*\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   let match;
   while ((match = regex.exec(String(text || ''))) !== null) {
     const id = match[1].trim();
@@ -870,8 +1041,8 @@ function parseTranslationJson(value) {
   return loose.size ? loose : null;
 }
 
-async function translateEntriesWithGemini(sourceEntries, systemText, label) {
-  const userText = buildTranslationUserText(sourceEntries);
+async function translateEntriesWithGemini(sourceEntries, systemText, label, previousEntries = []) {
+  const userText = buildTranslationUserText(sourceEntries, previousEntries);
   const maxOutputTokens = computeTranslationMaxOutputTokens(sourceEntries.length);
   const response = await translateWithGemini(systemText, userText, { maxOutputTokens });
   const translated = parseTranslationJson(response) || new Map();
@@ -913,9 +1084,9 @@ async function translateEntriesWithGemini(sourceEntries, systemText, label) {
   }));
 }
 
-async function translateChunkEntries(entries, systemText, label, depth = 0) {
+async function translateChunkEntries(entries, systemText, label, depth = 0, previousEntries = []) {
   try {
-    return await translateEntriesWithGemini(entries, systemText, label);
+    return await translateEntriesWithGemini(entries, systemText, label, previousEntries);
   } catch (error) {
     if (error.code !== 'INCOMPLETE' && error.code !== 'EMPTY_OUTPUT') throw error;
 
@@ -953,8 +1124,8 @@ async function translateChunkEntries(entries, systemText, label, depth = 0) {
 
     const mid = Math.ceil(entries.length / 2);
     console.warn(`[translation] ${label}: splitting ${entries.length} cues into ${mid}+${entries.length - mid} after: ${error.message}`);
-    const left = await translateChunkEntries(entries.slice(0, mid), systemText, `${label} [1/2]`, depth + 1);
-    const right = await translateChunkEntries(entries.slice(mid), systemText, `${label} [2/2]`, depth + 1);
+    const left = await translateChunkEntries(entries.slice(0, mid), systemText, `${label} [1/2]`, depth + 1, previousEntries);
+    const right = await translateChunkEntries(entries.slice(mid), systemText, `${label} [2/2]`, depth + 1, entries.slice(Math.max(0, mid - CONTEXT_CUES), mid));
     return [...left, ...right];
   }
 }
@@ -966,7 +1137,7 @@ async function translateChunk(chunk, context) {
 
   // Vsak chunk se ob napaki samodejno razdeli na manjše dele, zato en slab
   // odgovor modela ne pomeni več, da celoten film ostane nepreveden.
-  let resultEntries = await translateChunkEntries(sourceEntries, systemText, label);
+  let resultEntries = await translateChunkEntries(sourceEntries, systemText, label, 0, chunk.previousEntries || []);
 
   const tooFast = findTooFastCues(resultEntries);
   if (tooFast.length) {
@@ -1031,7 +1202,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
   if (inflight.has(key)) return inflight.get(key);
 
   const job = (async () => {
-    const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`);
+    const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`, season, episode);
     const { srt: rawSource, language: usedLanguage, fileName: sourceFileName, matchedByHash, isNativeSlovene } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode);
 
     // Če že obstajajo originalni slovenski podnapisi, jih le očistimo (SDH) in postrežemo brez AI prevajanja
@@ -1063,20 +1234,9 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
       }
     }
 
-    // 2. Analiza likov in spolov s Gemini 3.1 Pro + TMDB
+    // 2. Analiza likov in spolov (Gemini + TMDB) -> zemljevid ime lika -> spol
     const characters = await analyzeCharacters(rawSource, meta);
-    const characterMap = new Map();
-    for (const c of characters) {
-      if (c.name && c.gender) {
-        characterMap.set(c.name.toLowerCase(), c.gender === 'female' ? 'Ženska' : (c.gender === 'male' ? 'Moški' : null));
-      }
-    }
-    for (const c of (meta.credits || [])) {
-      if (c.name && c.gender) {
-        const mapped = c.gender === 1 ? 'Ženska' : (c.gender === 2 ? 'Moški' : null);
-        if (mapped) characterMap.set(c.name.toLowerCase(), mapped);
-      }
-    }
+    const characterMap = buildCharacterGenderMap(meta, characters);
 
     // 3. Čiščenje SDH z dinamičnim dodeljevanjem spola govorca
     const sourceEntries = removeSdhEntries(rawSource, characterMap);
@@ -1086,6 +1246,11 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
     const chunks = chunkSrt(sourceEntries, CHUNK_SIZE);
+    // Vsak chunk dobi zadnjih nekaj cue-jev prejšnjega kot kontekst, da model ve,
+    // kdo govori in komu, tudi na meji med chunki.
+    chunks.forEach((chunk, i) => {
+      chunk.previousEntries = i > 0 ? chunks[i - 1].entries.slice(-CONTEXT_CUES) : [];
+    });
     console.log(`[translation] ${imdbId}: translating ${sourceEntries.length} cues in ${chunks.length} chunk(s) of up to ${CHUNK_SIZE}, model=${GEMINI_MODEL}`);
 
     const sourceIds = sourceEntries.map(e => e.id);
@@ -1418,7 +1583,7 @@ function createApp() {
     cacheDir: CACHE_DIR
   }));
 
-  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator (Gemini 3.1 Pro)</h1><p>Nastavi API ključe v Render Environment Variables (GEMINI_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
+  app.get('/configure', (_req, res) => res.type('html').send('<h1>Slo AI Subtitle Translator (Gemini Flash)</h1><p>Nastavi API ključe v Render Environment Variables (GEMINI_API_KEY, TMDB_API_KEY, OPENSUBTITLES_API_KEY).</p>'));
 
   function startTranslationJob(imdbId, key, sourceLanguage, videoHash, strict, season, episode) {
     if (jobs.has(key) && jobs.get(key)?.status !== 'failed') return;
@@ -1579,6 +1744,12 @@ module.exports = {
   parseCharacterLedger,
   ledgerToText,
   analyzeCharacters,
+  ANALYSIS_MODEL,
+  geminiModelsToTry,
+  buildCharacterGenderMap,
+  lookupCharacterGender,
+  removeSdhEntries,
+  buildTranslationUserText,
   resolveSourceLanguages,
   timecodeToSeconds,
   cueDurationSeconds,

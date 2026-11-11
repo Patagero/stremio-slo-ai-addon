@@ -54,7 +54,8 @@ test('empty Gemini candidate falls back to the next model', async () => {
   assert.equal(result, '{"translations":[]}');
   assert.equal(calls.length, 2);
   assert.ok(calls[0].includes('gemini-3.7-flash'));
-  assert.ok(calls[1].includes('gemini-2.5-flash'));
+  // A full Flash model falls back to another full Flash model first.
+  assert.ok(calls[1].includes('gemini-3.6-flash'));
 });
 
 test('output token budget grows with cue count and stays bounded', () => {
