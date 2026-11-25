@@ -172,11 +172,11 @@ function fitLine(pairs) {
   return { scale, offset: my - scale * mx };
 }
 
-function activityBins(cues, scale, offset) {
+function activityBins(cues, mapTime) {
   let maxEnd = 0;
   const spans = cues.map(c => {
-    const start = Math.max(0, c.start * scale + offset);
-    const end = Math.max(start + 1, c.end * scale + offset);
+    const start = Math.max(0, mapTime(c.start, c.start));
+    const end = Math.max(start + 1, mapTime(c.end, c.start));
     maxEnd = Math.max(maxEnd, end);
     return [start, end];
   });
@@ -189,9 +189,11 @@ function activityBins(cues, scale, offset) {
 }
 
 // Koliko se "kdaj je na zaslonu podnapis" ujema po transformaciji (0..1).
-function activityScore(refCues, srcCues, scale, offset) {
-  const ref = activityBins(refCues, 1, 0);
-  const src = activityBins(srcCues, scale, offset);
+// `scaleOrMap` je lahko število (z `offset`) ali funkcija (t, začetekCueja) -> t'.
+function activityScore(refCues, srcCues, scaleOrMap, offset = 0) {
+  const mapTime = typeof scaleOrMap === 'function' ? scaleOrMap : t => t * scaleOrMap + offset;
+  const ref = activityBins(refCues, t => t);
+  const src = activityBins(srcCues, mapTime);
   let first = -1; let last = -1; let srcActive = 0; let intersection = 0;
   for (let i = 0; i < src.length; i++) {
     if (!src[i]) continue;
@@ -206,6 +208,149 @@ function activityScore(refCues, srcCues, scale, offset) {
   const precision = intersection / srcActive;
   const recall = refActive ? intersection / refActive : 0;
   return 0.72 * precision + 0.28 * recall;
+}
+
+
+// ---------- Sinhronizacija po odsekih ----------
+//
+// Dve izdaji se pogosto ne razlikujeta le za en zamik: drugačen uvod sredi filma,
+// izrezan/dodan prizor ali TV premori za oglase pomenijo, da ima vsak del filma svoj
+// zamik. En sam linearni popravek takrat uskladi le del filma. Zato (kot alass)
+// z dinamičnim programiranjem poiščemo zaporedje zamikov po referenčni časovnici:
+// vsak cue "plača" razdaljo do najbližjega začetka vira, vsaka sprememba zamika
+// pa fiksno kazen, tako da odsek nastane le, kadar ga podpira dovolj stavkov.
+
+const PIECE_BIN_MS = 100;
+const PIECE_SWITCH_PENALTY = 9;     // koliko "slabih" cue-jev odtehta en rez
+const PIECE_MIN_MATCHES = 12;       // vsak odsek mora imeti vsaj toliko ujemanj
+const PIECE_MIN_DURATION_MS = 90000;
+const PIECE_MERGE_MS = 400;         // bližnja zamika združimo v en odsek
+const MAX_PIECES = 8;
+
+function evaluateMapping(refCues, srcCues, refStarts, mapStart, mapTime) {
+  const mapped = srcCues.map(c => mapStart(c.start)).sort((a, b) => a - b);
+  const matches = matchStarts(refStarts, mapped, 0);
+  return {
+    matches: matches.length,
+    score: matches.length / Math.min(refStarts.length, srcCues.length),
+    segments: segmentsCovered(matches, refStarts),
+    activity: activityScore(refCues, srcCues, mapTime)
+  };
+}
+
+// Vrne [{ srcFrom, offset }] (urejeno po srcFrom; prvi ima srcFrom = -Infinity) ali null.
+function findPieces(refStarts, srcScaled, centerOffset) {
+  const n = refStarts.length;
+  if (n < PIECE_MIN_MATCHES * 2) return null;
+  const halfBins = Math.round(MAX_OFFSET_MS / PIECE_BIN_MS);
+  const bins = halfBins * 2 + 1;
+  const base = Math.round(centerOffset / PIECE_BIN_MS) - halfBins; // offset(b) = (base + b) * BIN
+  const tolBins = Math.ceil(MATCH_TOLERANCE_MS / PIECE_BIN_MS);
+  const cost = new Float32Array(bins);
+  let dp = new Float32Array(bins);
+  let next = new Float32Array(bins);
+  const switched = new Uint8Array(n * bins);
+  const switchFrom = new Int32Array(n);
+
+  for (let i = 0; i < n; i++) {
+    const r = refStarts[i];
+    cost.fill(1);
+    const lo = (base) * PIECE_BIN_MS;
+    const hi = (base + bins - 1) * PIECE_BIN_MS;
+    for (let j = lowerBound(srcScaled, r - hi - MATCH_TOLERANCE_MS); j < srcScaled.length && srcScaled[j] <= r - lo + MATCH_TOLERANCE_MS; j++) {
+      const exact = (r - srcScaled[j]) / PIECE_BIN_MS - base;
+      const from = Math.max(0, Math.ceil(exact - tolBins));
+      const to = Math.min(bins - 1, Math.floor(exact + tolBins));
+      for (let b = from; b <= to; b++) {
+        const c = Math.abs(b - exact) * PIECE_BIN_MS / MATCH_TOLERANCE_MS;
+        if (c < cost[b]) cost[b] = c;
+      }
+    }
+    if (i === 0) {
+      for (let b = 0; b < bins; b++) dp[b] = cost[b];
+      continue;
+    }
+    let bestPrev = 0;
+    for (let b = 1; b < bins; b++) if (dp[b] < dp[bestPrev]) bestPrev = b;
+    switchFrom[i] = bestPrev;
+    const switchCost = dp[bestPrev] + PIECE_SWITCH_PENALTY;
+    const row = i * bins;
+    for (let b = 0; b < bins; b++) {
+      if (switchCost < dp[b]) { next[b] = switchCost + cost[b]; switched[row + b] = 1; } else next[b] = dp[b] + cost[b];
+    }
+    [dp, next] = [next, dp];
+  }
+
+  let b = 0;
+  for (let k = 1; k < bins; k++) if (dp[k] < dp[b]) b = k;
+  const path = new Int32Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    path[i] = b;
+    if (i > 0 && switched[i * bins + b]) b = switchFrom[i];
+  }
+
+  // Odseki v referenčni časovnici, z natančnim zamikom (mediana ostankov ujemanj).
+  let pieces = [];
+  for (let i = 0; i < n; i++) {
+    const offset = (base + path[i]) * PIECE_BIN_MS;
+    const last = pieces[pieces.length - 1];
+    if (last && last.binOffset === offset) last.to = i; else pieces.push({ binOffset: offset, from: i, to: i });
+  }
+  const refine = piece => {
+    const starts = refStarts.slice(piece.from, piece.to + 1);
+    const matches = matchStarts(starts, srcScaled, piece.binOffset, FINE_TOLERANCE_MS);
+    piece.matches = matches;
+    piece.offset = matches.length ? median(matches.map(m => m.ref - m.src)) : piece.binOffset;
+    return piece;
+  };
+  pieces.forEach(refine);
+
+  // Prekratke odseke in skoraj enake sosede združimo.
+  for (let changed = true; changed && pieces.length > 1;) {
+    changed = false;
+    let weakest = -1;
+    for (let k = 0; k < pieces.length; k++) {
+      const p = pieces[k];
+      const duration = refStarts[p.to] - refStarts[p.from];
+      const neighbourClose = (k > 0 && Math.abs(pieces[k - 1].offset - p.offset) < PIECE_MERGE_MS)
+        || (k + 1 < pieces.length && Math.abs(pieces[k + 1].offset - p.offset) < PIECE_MERGE_MS);
+      if (p.matches.length < PIECE_MIN_MATCHES || duration < PIECE_MIN_DURATION_MS || neighbourClose) {
+        if (weakest < 0 || p.matches.length < pieces[weakest].matches.length) weakest = k;
+      }
+    }
+    if (weakest < 0) break;
+    const p = pieces[weakest];
+    const prev = pieces[weakest - 1];
+    const nxt = pieces[weakest + 1];
+    const target = !prev ? nxt : !nxt ? prev
+      : (Math.abs(prev.offset - p.offset) <= Math.abs(nxt.offset - p.offset) ? prev : nxt);
+    target.from = Math.min(target.from, p.from);
+    target.to = Math.max(target.to, p.to);
+    target.binOffset = target.offset;
+    pieces.splice(weakest, 1);
+    refine(target);
+    changed = true;
+  }
+  if (pieces.length < 2 || pieces.length > MAX_PIECES) return null;
+
+  // Meje v časovnici vira: sredina med zadnjim ujemanjem enega in prvim ujemanjem naslednjega odseka.
+  const result = [{ srcFrom: -Infinity, offset: pieces[0].offset }];
+  for (let k = 1; k < pieces.length; k++) {
+    const prevMatches = pieces[k - 1].matches;
+    const curMatches = pieces[k].matches;
+    if (!prevMatches.length || !curMatches.length) return null;
+    const a = prevMatches[prevMatches.length - 1].src;
+    const c = curMatches[0].src;
+    if (!(c > a)) return null; // odseka se v viru prekrivata - ni smiselna rešitev
+    result.push({ srcFrom: (a + c) / 2, offset: pieces[k].offset });
+  }
+  return result;
+}
+
+function pieceOffsetAt(pieces, scaledTime) {
+  let offset = pieces[0].offset;
+  for (const p of pieces) if (scaledTime >= p.srcFrom) offset = p.offset; else break;
+  return offset;
 }
 
 /**
@@ -254,11 +399,34 @@ function computeSync(referenceSrt, sourceSrt, thresholds = {}) {
 
   const finalScaled = srcStartsRaw.map(t => t * scale);
   const finalMatches = matchStarts(refStarts, finalScaled, offset);
-  const matches = finalMatches.length;
-  const score = matches / Math.min(refStarts.length, srcStartsRaw.length);
-  const segments = segmentsCovered(finalMatches, refStarts);
-  const activity = activityScore(refCues, srcCues, scale, offset);
-  const margin = best.margin;
+  let matches = finalMatches.length;
+  let score = matches / Math.min(refStarts.length, srcStartsRaw.length);
+  let segments = segmentsCovered(finalMatches, refStarts);
+  let activity = activityScore(refCues, srcCues, scale, offset);
+  let margin = best.margin;
+  let pieces = null;
+
+  // Ali ima film več odsekov z različnimi zamiki? Pri tem uporabimo hitrost iz
+  // kandidatov (regresija čez rez bi hitrost popačila).
+  if (limits.piecewise !== false) {
+    const pieceScale = best.scale;
+    const scaledSorted = srcStartsRaw.map(t => t * pieceScale);
+    const found = findPieces(refStarts, scaledSorted, best.offset);
+    if (found) {
+      const mapStart = t => t * pieceScale + pieceOffsetAt(found, t * pieceScale);
+      const mapTime = (t, cueStart) => t * pieceScale + pieceOffsetAt(found, cueStart * pieceScale);
+      const evaluated = evaluateMapping(refCues, srcCues, refStarts, mapStart, mapTime);
+      // Odseke sprejmemo le, če opazno izboljšajo ujemanje in ne pokvarijo prekrivanja.
+      if (evaluated.score >= score + 0.04 && evaluated.activity >= activity - 0.02) {
+        pieces = found.map(p => ({ srcFrom: Number.isFinite(p.srcFrom) ? Math.round(p.srcFrom / pieceScale) : null, offsetMs: Math.round(p.offset) }));
+        scale = pieceScale;
+        offset = found[0].offset;
+        ({ matches, score, segments, activity } = evaluated);
+        // Dvoumnost med dvema zamikoma je zdaj razložena z rezom.
+        margin = Math.max(margin, limits.minMargin);
+      }
+    }
+  }
 
   const problems = [];
   if (matches < limits.minMatches) problems.push(`premalo ujemanj (${matches})`);
@@ -270,13 +438,14 @@ function computeSync(referenceSrt, sourceSrt, thresholds = {}) {
   const roundedScale = Math.abs(scale - 1) < 0.0003 ? 1 : scale;
   const offsetMs = Math.round(offset);
   // "Že usklajeno": pri dolžini 2 h pomeni 0,0003 največ ~2 s razlike na koncu, kar regresija že pokrije.
-  const inSync = roundedScale === 1 && Math.abs(offsetMs) < 200;
+  const inSync = !pieces && roundedScale === 1 && Math.abs(offsetMs) < 200;
 
   return {
     ok: problems.length === 0,
     inSync,
     scale: roundedScale,
     offsetMs,
+    pieces,
     score,
     matches,
     margin,
@@ -287,11 +456,31 @@ function computeSync(referenceSrt, sourceSrt, thresholds = {}) {
 }
 
 // Uporabi transformacijo t' = scale * t + offset na vse časovne žige SRT besedila.
-function applySync(srt, scale = 1, offsetMs = 0) {
-  if (scale === 1 && Math.abs(offsetMs) < 1) return srt;
-  return String(srt || '').replace(new RegExp(TIMING_RE.source, 'g'), (_all, h1, m1, s1, ms1, h2, m2, s2, ms2) => {
-    const start = Math.max(0, toMs(h1, m1, s1, ms1) * scale + offsetMs);
-    const end = Math.max(start + 300, toMs(h2, m2, s2, ms2) * scale + offsetMs);
+// Klic: applySync(srt, scale, offsetMs[, pieces]) ali applySync(srt, rezultatComputeSync).
+// Pri odsekih ima vsak del vira svoj zamik (meja `srcFrom` je v časih vira).
+// Obvestilni cue (id 0) ostane, kjer je.
+function applySync(srt, scale = 1, offsetMs = 0, pieces = null) {
+  if (scale && typeof scale === 'object') {
+    ({ scale = 1, offsetMs = 0, pieces = null } = scale);
+  }
+  const hasPieces = Array.isArray(pieces) && pieces.length > 1;
+  if (!hasPieces && scale === 1 && Math.abs(offsetMs) < 1) return srt;
+  const offsetFor = srcStart => {
+    if (!hasPieces) return offsetMs;
+    let offset = pieces[0].offsetMs;
+    for (const p of pieces) if (p.srcFrom == null || srcStart >= p.srcFrom) offset = p.offsetMs; else break;
+    return offset;
+  };
+  const text = String(srt || '');
+  return text.replace(new RegExp(TIMING_RE.source, 'g'), (all, h1, m1, s1, ms1, h2, m2, s2, ms2, at) => {
+    const lineStart = text.lastIndexOf('\n', at - 1) + 1;
+    const prevLineStart = lineStart > 0 ? text.lastIndexOf('\n', lineStart - 2) + 1 : -1;
+    const idLine = prevLineStart >= 0 ? text.slice(prevLineStart, lineStart - 1) : '';
+    if (idLine.replace(/^\uFEFF/, '').trim() === '0') return all;
+    const srcStart = toMs(h1, m1, s1, ms1);
+    const offset = offsetFor(srcStart);
+    const start = Math.max(0, srcStart * scale + offset);
+    const end = Math.max(start + 300, toMs(h2, m2, s2, ms2) * scale + offset);
     return `${msToTimecode(start)} --> ${msToTimecode(end)}`;
   });
 }
@@ -303,6 +492,9 @@ function describeSync(result) {
   const parts = [];
   if (result.offsetMs) parts.push(`zamik ${(result.offsetMs / 1000).toFixed(2)} s`);
   if (result.scale !== 1) parts.push(`hitrost ×${result.scale.toFixed(5)}`);
+  if (result.pieces && result.pieces.length > 1) {
+    parts.push(`${result.pieces.length} odseki: ${result.pieces.map(p => `${(p.offsetMs / 1000).toFixed(2)} s`).join(' / ')}`);
+  }
   return `${parts.join(', ')} (ujemanje ${(result.score * 100).toFixed(0)} %)`;
 }
 

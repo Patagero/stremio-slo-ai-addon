@@ -119,3 +119,34 @@ test('extractCues skips the notice cue (id 0) and empty cues', () => {
   const cues = extractCues('0\n00:00:01,000 --> 00:00:05,000\nObvestilo\n\n1\n00:01:00,000 --> 00:01:02,000\nBesedilo\n\n2\n00:01:03,000 --> 00:01:04,000\n\n');
   assert.deepEqual(cues, [{ start: 60000, end: 62000 }]);
 });
+
+// Druga izdaja z rezi: po vsakem rezu se zamik spremeni (npr. drugačen uvod, TV premori).
+function deriveCutSource(reference, cuts, seed) {
+  const offsetAt = t => cuts.reduce((sum, cut) => (t >= cut.at ? sum + cut.shift : sum), 0);
+  const base = deriveSource(reference, { scale: 1, offset: 0, seed });
+  return base.map(c => ({ start: c.start - offsetAt(c.start), end: c.end - offsetAt(c.start) }));
+}
+
+test('computeSync aligns a release with cuts piece by piece', () => {
+  const reference = makeTimeline(11, 900);
+  const source = deriveCutSource(reference, [{ at: 1800000, shift: 3000 }, { at: 3600000, shift: 4500 }], 12);
+  const result = computeSync(toSrt(reference), toSrt(source));
+  assert.equal(result.ok, true, result.reason);
+  assert.ok(result.pieces && result.pieces.length === 3, `pieces ${JSON.stringify(result.pieces)}`);
+  assertAligned(reference, applySync(toSrt(source), result));
+});
+
+test('computeSync does not invent cuts for a plain delay', () => {
+  const reference = makeTimeline(13);
+  const source = deriveSource(reference, { scale: 1, offset: 2500, seed: 14 });
+  const result = computeSync(toSrt(reference), toSrt(source));
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.pieces, null);
+});
+
+test('applySync leaves the notice cue (id 0) untouched', () => {
+  const srt = '0\n00:00:01,000 --> 00:00:05,000\nObvestilo\n\n1\n00:01:00,000 --> 00:01:02,000\nBesedilo\n';
+  const shifted = applySync(srt, 1, 30000);
+  assert.match(shifted, /^0\n00:00:01,000 --> 00:00:05,000\nObvestilo/);
+  assert.match(shifted, /00:01:30,000 --> 00:01:32,000/);
+});
