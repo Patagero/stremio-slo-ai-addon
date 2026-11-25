@@ -3,6 +3,7 @@ const axios = require('axios');
 const fs = require('node:fs');
 const path = require('node:path');
 const subsync = require('./subsync');
+const gender = require('./gender');
 
 // Samodejno nalaganje .env datoteke, če obstaja (za razvoj)
 try {
@@ -101,7 +102,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.7',
+  version: '0.8.0',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -225,7 +226,7 @@ function reconcileTranslatedSrt(source, candidate) {
     const found = byId.get(String(entry.id));
     let text = found?.text?.trim() || entry.text;
     // Očisti tehnične oznake govorca [Govorec: ...] in formatiraj na max 2 vrstici
-    text = text.replace(/\[(?:Govorec|Govorita|Speaker)[^\]]*\]/gi, '').replace(/\s{2,}/g, ' ').trim();
+    text = text.replace(SPEAKER_TAG_CLEAN_RE, '').replace(/\s{2,}/g, ' ').trim();
     if (text.length > MAX_LINE_CHARS && !text.includes('\n')) {
       text = splitIntoTwoLines(text);
     }
@@ -246,7 +247,7 @@ const SDH_PAREN_RE = /\((?:laughter|giggle|gasp|sobbing|crying|music|sigh|groan|
 const SDH_ASTERISK_RE = /\*[^*]*\*/g;
 const SDH_MUSIC_NOTE_RE = /[♪♫][^♪♫\n]*[♪♫]?/g;
 const SDH_SPEAKER_LABEL_RE = /^[-\s]*[A-ZČŠŽĐĆ0-9 .'-]{2,30}:\s*/;
-const SPEAKER_TAG_CLEAN_RE = /\[(?:Govorec|Govorita|Speaker)[^\]]*\]/gi;
+const SPEAKER_TAG_CLEAN_RE = /\[(?:Govorec|Govorita|Nagovorjeni|Speaker)[^\]]*\]/gi;
 
 function extractSpeakerFromRawText(rawText) {
   const m = String(rawText || '').match(/^[-\s]*([A-ZČŠŽĐĆa-z0-9 .'-]{2,25}):\s*/);
@@ -303,8 +304,9 @@ function removeSdhEntries(srtText, characterMap = new Map()) {
     const lineInfo = rawLines
       .map(line => {
         const speaker = extractSpeakerFromRawText(line);
-        const gender = lookupCharacterGender(characterMap, speaker) || detectGenderFromDialogue(line);
-        return { text: stripSdhFromLine(line), gender, startsTurn: /^\s*[-–—]/.test(line) || Boolean(speaker) };
+        const grammar = gender.detectSourceGender(line);
+        const speakerGender = lookupCharacterGender(characterMap, speaker) || detectGenderFromDialogue(line) || grammar.speaker;
+        return { text: stripSdhFromLine(line), gender: speakerGender, addressee: grammar.addressee, startsTurn: /^\s*[-–—]/.test(line) || Boolean(speaker) };
       })
       .filter(info => info.text);
     if (!lineInfo.length) continue;
@@ -312,21 +314,21 @@ function removeSdhEntries(srtText, characterMap = new Map()) {
 
     // Cue z dvema govorcema ("- ...\n- ..."): vsak govorec dobi svojo oznako.
     const isTwoSpeakerCue = lineInfo.length === 2 && lineInfo.every(info => info.startsTurn);
-    let genderTag = '';
-    if (isTwoSpeakerCue) {
-      if (lineInfo.some(info => info.gender)) {
-        genderTag = `[Govorec 1: ${lineInfo[0].gender || 'neznan'}; Govorec 2: ${lineInfo[1].gender || 'neznan'}]`;
-      }
-    } else {
-      const detectedGender = lineInfo.map(info => info.gender).find(Boolean);
-      if (detectedGender) genderTag = `[Govorec: ${detectedGender}]`;
-    }
+    const genderHint = isTwoSpeakerCue
+      ? { speaker: null, lineSpeakers: lineInfo.map(info => info.gender || null), addressee: null }
+      : {
+          speaker: lineInfo.map(info => info.gender).find(Boolean) || null,
+          lineSpeakers: null,
+          addressee: lineInfo.map(info => info.addressee).find(Boolean) || null
+        };
+    const genderTag = gender.formatGenderTag(genderHint);
 
     entries.push({
       ...entry,
       id: String(index++),
       text: cleanedLines.join('\n'),
-      genderTag
+      genderTag,
+      genderHint
     });
   }
 
@@ -946,6 +948,11 @@ function prependNoticeCue(srtText, noticeMessage) {
 async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode, options = {}) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
   const selection = createSourceSelection({ imdbId, videoHash, videoFileName: options.videoFileName, season, episode });
+  const found = await selectSourceSubtitle(selection, imdbId, meta, requestedLanguage, strict, options);
+  return { ...found, selection };
+}
+
+async function selectSourceSubtitle(selection, imdbId, meta, requestedLanguage, strict, options = {}) {
 
   // Ročna izbira: uporabnik je v Stremiu izbral točno določen izvorni podnapis.
   if (options.fileId) {
@@ -988,6 +995,93 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
     return fallback;
   }
   throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
+}
+
+// ---------- Hrvaški pomočnik za spol ----------
+//
+// Ko prevajamo iz angleščine (ali italijanščine), poiščemo še hrvaški podnapis istega
+// filma. Hrvaščina spol zapiše v glagolu ("rekla sam", "gdje si bio?"), zato iz njega
+// po času preberemo spol govorca in nagovorjenega za vsak cue. Strojno prevedenih
+// hrvaških podnapisov ne uporabimo, ker je spol v njih pogosto ugibanje.
+
+const GENDER_HELPER_ENABLED = String(process.env.GENDER_HELPER || 'true').toLowerCase() !== 'false';
+const GENDER_HELPER_LANGUAGE = 'hr';
+// Koliko hrvaških kandidatov največ prenesemo (prenosi štejejo v dnevno kvoto OpenSubtitles).
+const GENDER_HELPER_MAX_DOWNLOADS = Math.max(1, Math.min(4, Number(process.env.GENDER_HELPER_MAX_DOWNLOADS || 2)));
+
+// Poravna hrvaški podnapis na časovnico izvornega. Vrne { cues, sync } ali null, če se ne ujemata.
+function alignGenderHelper(sourceSrt, helperSrt) {
+  const result = subsync.computeSync(sourceSrt, helperSrt);
+  if (!result.ok) return { cues: null, sync: result };
+  const aligned = result.inSync ? helperSrt : subsync.applySync(helperSrt, result);
+  return { cues: gender.buildHelperCues(parseSrt(aligned)), sync: result };
+}
+
+async function fetchGenderHelper(selection, sourceLanguage, sourceSrt, sourceCandidate) {
+  if (!GENDER_HELPER_ENABLED || !selection || languageGroup(sourceLanguage) === GENDER_HELPER_LANGUAGE) return null;
+  const { imdbId, season, episode, videoFileName } = selection;
+  try {
+    const hashMatches = (await selection.hashMatches())
+      .filter(c => languageGroup(c.language) === GENDER_HELPER_LANGUAGE && !c.machineTranslated);
+    let candidates = rankSubtitleCandidates(hashMatches, videoFileName);
+    if (!candidates.length) {
+      const found = await searchOpenSubtitles({ ...baseOpenSubtitlesParams(imdbId, season, episode), languages: OPENSUBTITLES_LANGUAGE_CODES[GENDER_HELPER_LANGUAGE] });
+      candidates = rankSubtitleCandidates(found.filter(c => !c.machineTranslated), videoFileName);
+    }
+    if (sourceCandidate?.fileId) candidates = candidates.filter(c => c.fileId !== sourceCandidate.fileId);
+    let downloads = 0;
+    for (const candidate of candidates) {
+      if (downloads >= GENDER_HELPER_MAX_DOWNLOADS) break;
+      if (!isSubtitleFileCached(candidate.fileId)) downloads += 1;
+      let helperSrt;
+      try {
+        helperSrt = await downloadOpenSubtitleFile(candidate.fileId);
+      } catch (error) {
+        console.warn(`[gender] hrvaški pomočnik "${candidateLabel(candidate)}" ni bil prenesen: ${error.message}`);
+        continue;
+      }
+      const aligned = alignGenderHelper(sourceSrt, helperSrt);
+      if (aligned.cues) {
+        console.log(`[gender] hrvaški pomočnik: "${candidateLabel(candidate)}" (${subsync.describeSync(aligned.sync)})`);
+        return { cues: aligned.cues, candidate };
+      }
+      console.log(`[gender] hrvaški pomočnik "${candidateLabel(candidate)}" se časovno ne ujema z virom: ${aligned.sync.reason || 'negotovo'}`);
+    }
+  } catch (error) {
+    console.warn(`[gender] hrvaškega pomočnika ni bilo mogoče pridobiti: ${error.message}`);
+  }
+  return null;
+}
+
+// ---------- Kontrolni krog za spol ----------
+//
+// Po prevodu primerjamo spolne oblike v slovenščini ("sem bil", "si bila") s pričakovanim
+// spolom: oznake (SDH, izvirnik, hrvaški pomočnik), analiza likov po imenu govorca, ki ga
+// je zapisal model, in doslednost istega imena skozi film. Sporne cue-je popravi močnejši model.
+
+const GENDER_REVIEW_ENABLED = String(process.env.GENDER_REVIEW || 'true').toLowerCase() !== 'false';
+const GENDER_REVIEW_MAX_CUES = Math.max(0, Math.min(2000, Number(process.env.GENDER_REVIEW_MAX_CUES || 400)));
+
+async function reviewTranslationGender(partial, sourceEntries, characterMap, context, options = {}) {
+  if (!GENDER_REVIEW_ENABLED || GENDER_REVIEW_MAX_CUES <= 0) return { issues: 0, fixed: 0 };
+  const items = sourceEntries.map(entry => {
+    const stored = partial.entryMap.get(entry.id) || {};
+    return { id: entry.id, sourceText: entry.text, text: stored.text || '', hint: entry.genderHint || null, meta: stored.meta || null };
+  });
+  const issues = gender.findGenderIssues(items, { lookup: name => lookupCharacterGender(characterMap, name) });
+  if (!issues.length) return { issues: 0, fixed: 0 };
+  const fixes = await gender.reviewGenderIssues(items, issues, {
+    context,
+    model: ANALYSIS_MODEL,
+    maxCues: GENDER_REVIEW_MAX_CUES,
+    translate: options.translate || translateWithGemini,
+    log: message => console.warn(`[gender] kontrolni krog: ${message}`)
+  });
+  for (const [id, text] of fixes) {
+    const stored = partial.entryMap.get(id);
+    if (stored) partial.entryMap.set(id, { ...stored, text });
+  }
+  return { issues: issues.length, fixed: fixes.size };
 }
 
 // Seznam virov za ročno izbiro v Stremiu (samo iskanje, brez prenosov).
@@ -1060,8 +1154,8 @@ function buildGeminiRequest(systemText, userText, model = GEMINI_MODEL, options 
 
 function computeTranslationMaxOutputTokens(entryCount) {
   const count = Math.max(1, Number(entryCount) || 1);
-  // 112 žetonov na cue: prevod + polji spola ("g", "a") + rezerva za razmišljanje.
-  return Math.max(4096, Math.min(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, count * 112));
+  // 128 žetonov na cue: prevod + imeni ("s", "to") in spola ("g", "a") + rezerva za razmišljanje.
+  return Math.max(4096, Math.min(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, count * 128));
 }
 
 function extractGeminiOutputText(data) {
@@ -1229,6 +1323,8 @@ CORE TRANSLATION & SUBTITLING RULES:
 - ŽENSKA ([Govorec: Ženska]): obvezno uporabi ženske oblike glagolov v pretekliku ("rekla sem", "prišla sem", "bila sem", "videla sem", "si videla?", "si pripravljena?"), ženske pridevnike ("sama", "vesela", "utrujena", "hvaležna") in ustrezne ženske zaimke.
 - MOŠKI ([Govorec: Moški]): obvezno uporabi moške oblike ("rekel sem", "prišel sem", "bil sem", "videl sem", "si videl?", "si pripravljen?", "sam", "vesel").
 - Oznaka [Govorec 1: ...; Govorec 2: ...] pomeni cue z dvema govorcema: prva vrstica pripada prvemu, druga drugemu.
+- Oznaka [Nagovorjeni: Ženska] / [Nagovorjeni: Moški] pove spol osebe, ki ji govorec govori ("Kje si bila?" / "Kje si bil?"). Upoštevaj jo enako strogo kot oznako govorca.
+- Oznake pogosto izhajajo iz hrvaškega podnapisa istega prizora, ki spol zapiše v glagolu ("rekla sam"), zato so zanesljivejše od ugibanja iz angleščine.
 - V hrvaščini in italijanščini dodatno izkoristi očitne spolne končnice izvirnika ("rekla sam" -> "rekla sem", "sono andata" -> "šla sem").
 - Pravilno uporabljaj slovensko dvojino (npr. "greva", "bova videla/videli").
 - POMEMBNO: Tehničnih oznak [Govorec: ...] NIKOLI ne vključuj v končno besedilo prevoda!
@@ -1272,10 +1368,13 @@ Slovenščina označi spol pri treh različnih osebah. Za vsak cue preveri vse t
 6. POPOLNA TEHNIČNA INTEGRITETA SRT:
 - Ohraniti moraš točne ID številke vseh podnapisov.
 - Cue-ji pod "PREJŠNJI CUE-JI" so samo kontekst — NE prevajaj jih in jih NE vračaj.
-- Za vsak cue NAJPREJ določi spol in ga zapiši, ŠELE NATO napiši prevod, ki se s tem ujema:
+- Za vsak cue NAJPREJ zapiši, kdo govori in komu, ŠELE NATO napiši prevod, ki se s tem ujema:
+  "s" = ime govorca, kot je zapisano v CHARACTER LEDGER ali TMDB (pri dveh govorcih "Ana / Marko"); "?" če ga ne poznaš.
+  "to" = ime nagovorjene osebe (ali "?" če ni jasno ali nihče ni nagovorjen; "vsi" za skupino).
   "g" = spol govorca: "F" (ženska), "M" (moški), "FM" (dva govorca v cue-ju), "?" (neznan -> nevtralna oblika).
   "a" = spol nagovorjenega: "F", "M", "P" (več oseb ali vikanje), "?" (neznan ali nihče ni nagovorjen).
-- Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","g":"F","a":"M","text":"Prva vrstica\\nDruga vrstica"}]}`;
+- Ista oseba ima v "s" in "to" vedno isto ime skozi ves film (ne izmenjuj imena in vzdevka).
+- Izhod vrni IZKLJUČNO kot JSON v obliki: {"translations":[{"id":"1","s":"Ana","to":"Marko","g":"F","a":"M","text":"Prva vrstica\\nDruga vrstica"}]}`;
 }
 
 function buildTranslationUserText(sourceEntries, previousEntries = []) {
@@ -1294,9 +1393,9 @@ function buildTranslationUserText(sourceEntries, previousEntries = []) {
     ? `PREJŠNJI CUE-JI (samo kontekst za to, kdo govori in komu — NE prevajaj, NE vračaj):\n${previous.join('\n')}\n\n`
     : '';
   return `Prevedi vsak cue v naravno slovenščino (max 2 vrstici na cue, strogo upoštevaj označeni spol govorca [Govorec: ...]).
-Pri vsakem cue-ju najprej določi spol govorca ("g") in nagovorjenega ("a"), nato napiši prevod, ki se z njima ujema.
-V izhodu NE vključuj tehničnih oznak [Govorec: ...], ampak samo čist slovenski dialog.
-Return JSON: {"translations": [{"id": "...", "g": "F|M|FM|?", "a": "F|M|P|?", "text": "..."}]}
+Pri vsakem cue-ju najprej določi govorca ("s") in nagovorjenega ("to") ter njun spol ("g", "a"), nato napiši prevod, ki se z njimi ujema.
+V izhodu NE vključuj tehničnih oznak [Govorec: ...] ali [Nagovorjeni: ...], ampak samo čist slovenski dialog.
+Return JSON: {"translations": [{"id": "...", "s": "ime|?", "to": "ime|?", "g": "F|M|FM|?", "a": "F|M|P|?", "text": "..."}]}
 
 ${previousBlock}SOURCE CUES:
 ${lines.join('\n')}`;
@@ -1325,21 +1424,38 @@ function buildTranslationSchema(expectedCount) {
 }
 const TRANSLATION_SCHEMA = buildTranslationSchema(undefined);
 
+const TRANSLATION_META_FIELDS = ['s', 'to', 'g', 'a'];
+
+function pickTranslationMeta(item) {
+  const meta = {};
+  for (const field of TRANSLATION_META_FIELDS) {
+    if (typeof item?.[field] === 'string' && item[field].trim()) meta[field] = item[field].trim().slice(0, 60);
+  }
+  return Object.keys(meta).length ? meta : null;
+}
+
 function extractTranslationPairsLoosely(text) {
   const map = new Map();
-  // Med "id" in "text" sta lahko kratki polji spola ("g", "a").
-  const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,(?:\s*"[a-z]{1,3}"\s*:\s*"[^"\n]{0,8}"\s*,)*\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  map.meta = new Map();
+  // Med "id" in "text" so lahko kratka polja govorca in spola ("s", "to", "g", "a").
+  const regex = /"id"\s*:\s*"?([^"\n,}]+)"?\s*,((?:\s*"[a-z]{1,3}"\s*:\s*"[^"\n]{0,60}"\s*,)*)\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   let match;
   while ((match = regex.exec(String(text || ''))) !== null) {
     const id = match[1].trim();
     let decoded;
     try {
-      decoded = JSON.parse(`"${match[2]}"`);
+      decoded = JSON.parse(`"${match[3]}"`);
     } catch (_) {
-      decoded = match[2].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+      decoded = match[3].replace(/\\"/g, '"').replace(/\\n/g, '\n');
     }
     decoded = decoded.trim();
-    if (id && decoded) map.set(id, decoded);
+    if (id && decoded) {
+      map.set(id, decoded);
+      const fields = {};
+      for (const f of match[2].matchAll(/"([a-z]{1,3})"\s*:\s*"([^"\n]{0,60})"/g)) fields[f[1]] = f[2];
+      const meta = pickTranslationMeta(fields);
+      if (meta) map.meta.set(id, meta);
+    }
   }
   return map;
 }
@@ -1353,9 +1469,15 @@ function parseTranslationJson(value) {
     const data = JSON.parse(raw);
     const list = Array.isArray(data) ? data : Array.isArray(data?.translations) ? data.translations : null;
     if (list) {
+      // Mapa id -> besedilo; `map.meta` hrani id -> { s, to, g, a } (kdo govori in komu).
       const map = new Map();
+      map.meta = new Map();
       for (const item of list) {
-        if (item?.id != null && typeof item.text === 'string' && item.text.trim()) map.set(String(item.id), item.text.trim());
+        if (item?.id != null && typeof item.text === 'string' && item.text.trim()) {
+          map.set(String(item.id), item.text.trim());
+          const meta = pickTranslationMeta(item);
+          if (meta) map.meta.set(String(item.id), meta);
+        }
       }
       if (map.size) return map;
     }
@@ -1371,6 +1493,7 @@ async function translateEntriesWithGemini(sourceEntries, systemText, label, prev
   const maxOutputTokens = computeTranslationMaxOutputTokens(sourceEntries.length);
   const response = await translateWithGemini(systemText, userText, { maxOutputTokens });
   const translated = parseTranslationJson(response) || new Map();
+  const metaById = translated.meta instanceof Map ? translated.meta : new Map();
 
   let missing = sourceEntries.filter(entry => !translated.has(String(entry.id)));
   if (missing.length) {
@@ -1385,6 +1508,8 @@ async function translateEntriesWithGemini(sourceEntries, systemText, label, prev
         for (const entry of missing) {
           const text = repairedMap.get(String(entry.id));
           if (typeof text === 'string' && text.trim()) translated.set(String(entry.id), text.trim());
+          const meta = repairedMap.meta?.get(String(entry.id));
+          if (meta) metaById.set(String(entry.id), meta);
         }
       }
     } catch (error) {
@@ -1397,16 +1522,18 @@ async function translateEntriesWithGemini(sourceEntries, systemText, label, prev
   if (missing.length) {
     const error = new Error(`${label} still incomplete after repair (${sourceEntries.length - missing.length}/${sourceEntries.length})`);
     error.code = 'INCOMPLETE';
+    translated.meta = metaById;
     error.partialTranslations = translated;
     error.missingEntries = missing;
     throw error;
   }
 
-  return sourceEntries.map(entry => ({
-    id: entry.id,
-    timecode: entry.timecode,
-    text: translated.get(String(entry.id))
-  }));
+  return sourceEntries.map(entry => {
+    const result = { id: entry.id, timecode: entry.timecode, text: translated.get(String(entry.id)) };
+    const meta = metaById.get(String(entry.id));
+    if (meta) result.meta = meta;
+    return result;
+  });
 }
 
 async function translateChunkEntries(entries, systemText, label, depth = 0, previousEntries = []) {
@@ -1425,12 +1552,17 @@ async function translateChunkEntries(entries, systemText, label, depth = 0, prev
       console.warn(`[translation] ${label}: retrying only ${missing.length} missing cue(s)`);
       try {
         const missingTranslated = await translateChunkEntries(missing, systemText, `${label} [missing]`, depth + 1);
-        for (const entry of missingTranslated) partial.set(String(entry.id), entry.text);
-        return entries.map(entry => ({
-          id: entry.id,
-          timecode: entry.timecode,
-          text: partial.get(String(entry.id)) || entry.text
-        }));
+        const partialMeta = partial.meta instanceof Map ? partial.meta : new Map();
+        for (const entry of missingTranslated) {
+          partial.set(String(entry.id), entry.text);
+          if (entry.meta) partialMeta.set(String(entry.id), entry.meta);
+        }
+        return entries.map(entry => {
+          const result = { id: entry.id, timecode: entry.timecode, text: partial.get(String(entry.id)) || entry.text };
+          const meta = partialMeta.get(String(entry.id));
+          if (meta) result.meta = meta;
+          return result;
+        });
       } catch (innerError) {
         if (innerError.code !== 'INCOMPLETE' && innerError.code !== 'EMPTY_OUTPUT') throw innerError;
       }
@@ -1599,8 +1731,12 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     // 3. Čiščenje SDH z dinamičnim dodeljevanjem spola govorca
     const sourceEntries = removeSdhEntries(rawSource, characterMap);
     const source = toSrt(sourceEntries);
+
+    // 3a. Hrvaški pomočnik: spol govorca in nagovorjenega iz hrvaškega podnapisa istega prizora.
+    const helper = await fetchGenderHelper(found.selection, usedLanguage, rawSource, found.candidate);
+    const helperTagged = helper ? gender.applyHelperHints(sourceEntries, helper.cues) : 0;
     const taggedCount = sourceEntries.filter(e => e.genderTag).length;
-    console.log(`[translation] ${imdbId}: cues after SDH cleanup=${sourceEntries.length}/${parseSrt(rawSource).length} (gender-tagged: ${taggedCount}/${sourceEntries.length})`);
+    console.log(`[translation] ${imdbId}: cues after SDH cleanup=${sourceEntries.length}/${parseSrt(rawSource).length} (gender-tagged: ${taggedCount}/${sourceEntries.length}${helper ? `, ${helperTagged} from HR helper` : ''})`);
 
     const context = `${buildMetadataContext(meta)}\n\nCHARACTER LEDGER (from dialogue analysis):\n${ledgerToText(characters)}`;
     const chunks = chunkSrt(sourceEntries, CHUNK_SIZE);
@@ -1647,6 +1783,14 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     if (partial.failedChunkIndices.size > 0) {
       partials.set(key, partial);
       throw new Error(`${partial.failedChunkIndices.size}/${chunks.length} chunk(s) could not be translated this run (will retry next visit)`);
+    }
+
+    // 5. Kontrolni krog: sporne spolne oblike popravi močnejši model.
+    try {
+      const review = await reviewTranslationGender(partial, sourceEntries, characterMap, context);
+      if (review.issues) console.log(`[gender] ${imdbId}: kontrolni krog - spornih ${review.issues}, popravljenih ${review.fixed}`);
+    } catch (error) {
+      console.warn(`[gender] ${imdbId}: kontrolni krog ni uspel, prevod ostane nespremenjen: ${error.message}`);
     }
 
     const srt = partialToSrt(partial);
@@ -1706,7 +1850,11 @@ function createPartialTracker(sourceEntries, totalChunks) {
 }
 
 function mergeChunkIntoPartial(partial, entries, chunkIndex) {
-  for (const entry of entries) partial.entryMap.set(entry.id, { timecode: entry.timecode, text: entry.text });
+  for (const entry of entries) {
+    const stored = { timecode: entry.timecode, text: entry.text };
+    if (entry.meta) stored.meta = entry.meta;
+    partial.entryMap.set(entry.id, stored);
+  }
   if (typeof chunkIndex === 'number') {
     partial.doneChunkIndices.add(chunkIndex);
     partial.failedChunkIndices.delete(chunkIndex);
@@ -2178,6 +2326,8 @@ module.exports = {
   ensureKeepAlive,
   parseTranslationJson,
   extractTranslationPairsLoosely,
+  alignGenderHelper,
+  reviewTranslationGender,
   translateChunk,
   friendlyErrorMessage,
   statusNoticeSrt,
