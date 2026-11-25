@@ -101,7 +101,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.7.6',
+  version: '0.7.7',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -866,7 +866,7 @@ async function syncAgainstReference(selection, srt, label) {
   const name = label ? candidateLabel(label) : 'podnapis';
   console.log(`[sync] ${name}: ${subsync.describeSync(result)}`);
   if (!result.ok) return { srt, sync: result, verified: false };
-  return { srt: subsync.applySync(srt, result.scale, result.offsetMs), sync: result, verified: true };
+  return { srt: subsync.applySync(srt, result), sync: result, verified: true };
 }
 
 // Izbere najboljši podnapis enega jezika. Vrne null, če v tem jeziku ni nič.
@@ -1582,7 +1582,7 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
         const aligned = subsync.computeSync(rawSource, reusedSrt);
         if (aligned.ok && !aligned.inSync) {
           console.log(`[sync] ponovno uporabljen prevod: ${subsync.describeSync(aligned)}`);
-          reusedSrt = subsync.applySync(reusedSrt, aligned.scale, aligned.offsetMs);
+          reusedSrt = subsync.applySync(reusedSrt, aligned);
         }
         const reusedEntry = { srt: reusedSrt, expiresAt: genericCached.expiresAt };
         cache.set(key, reusedEntry);
