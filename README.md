@@ -21,7 +21,16 @@ Stremio addon za vrhunske slovenske podnapise s samodejno izbiro vira (Prioritet
    - **Naraven pogovorni jezik**: Tekoča, idiomatska slovenščina brez dobesednih prevodov.
    - **Tehnična integriteta**: Točno ohranjeni časovni žigi in številke podnapisov.
 
-4. **Shranjevanje rezultata**:
+4. **Skrbna izbira vira in samodejna sinhronizacija** (`subsync.js`):
+   - Če se podnapis v izvornem jeziku na OpenSubtitles ujema s hashem videa, se uporabi neposredno (časovnica je že pravilna).
+   - Sicer se kot referenčna časovnica uporabi podnapis v kateremkoli jeziku, ki se ujema s hashem videa. Najboljši kandidati (razvrščeni po imenu izdaje, viru WEB/BluRay, skupini, izdaji Extended ...) se časovno primerjajo z referenco; izbran je tisti z najboljšim potrjenim ujemanjem in samodejno popravljen (zamik in hitrost, npr. 23,976 ↔ 25 fps).
+   - Primerjajo se samo časi podnapisov, ne besedilo in ne zvok, zato deluje brez ffmpeg tudi na brezplačnem Renderju.
+   - Če noben kandidat ni potrjen, se preveri naslednji jezik; brez reference velja ujemanje imena izdaje.
+
+5. **Ročni ponovni prevod**:
+   - V Stremiu se poleg `Prevod iz HR/IT/ANG` prikažejo še vnosi `Ponovni prevod iz HR #1: <izdaja>`, `#2` ... (do 4 na jezik). Izbira takega vnosa prevede točno ta izvorni podnapis (vseeno časovno usklajen z videom), v ločen predpomnilnik.
+
+6. **Shranjevanje rezultata**:
    - Prevedeni slovenski podnapisi se trajno shranijo v `.sl.srt` datoteke na disk v predpomnilnik (`CACHE_DIR`).
 
 ## Lokalni zagon
@@ -46,3 +55,4 @@ V Renderju nastavite okoljske spremenljivke:
 - `TMDB_API_KEY` (brezplačni ključ na themoviedb.org)
 - `OPENSUBTITLES_API_KEY` (OpenSubtitles REST API ključ)
 - `PUBLIC_BASE_URL` (npr. `https://stremio-slo-ai-addon.onrender.com`)
+- neobvezno: `SUBTITLE_SYNC` (`false` izklopi sinhronizacijo), `SYNC_MAX_CANDIDATES` (privzeto 3), `SYNC_DOWNLOAD_BUDGET` (privzeto 6 prenosov na prevod), `MANUAL_CHOICES_PER_LANGUAGE` (privzeto 4)

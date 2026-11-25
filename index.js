@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('node:fs');
 const path = require('node:path');
+const subsync = require('./subsync');
 
 // Samodejno nalaganje .env datoteke, če obstaja (za razvoj)
 try {
@@ -612,50 +613,328 @@ function withOpenSubtitlesLimit(task) {
   return run;
 }
 
-async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode) {
-  return withOpenSubtitlesLimit(() => fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode));
+// ---------- Iskanje, skrbna izbira in sinhronizacija izvornih podnapisov ----------
+//
+// 1. Če ima video hash, poiščemo VSE podnapise, ki se na OpenSubtitles ujemajo s
+//    hashem (v kateremkoli jeziku). Ti so časovno narejeni za točno to datoteko.
+// 2. Če med njimi obstaja podnapis v želenem jeziku, ga vzamemo neposredno.
+// 3. Sicer je eden od njih "referenca": kandidate v želenem jeziku razvrstimo po
+//    metapodatkih (ime izdaje, vir WEB/BluRay, skupina, AI prevod ...), najboljše
+//    prenesemo in vsakega časovno primerjamo z referenco (subsync.js). Izberemo
+//    tistega z najboljšim potrjenim ujemanjem in ga premaknemo/raztegnemo na čase
+//    reference.
+// 4. Brez reference (ni hasha ali ni zadetkov) izberemo kandidata, katerega ime
+//    izdaje se najbolj ujema z imenom video datoteke.
+
+const OPENSUBTITLES_API = 'https://api.opensubtitles.com/api/v1';
+const OPENSUBTITLES_LANGUAGE_CODES = { hr: 'hr,sr,bs', it: 'it', en: 'en', sl: 'sl' };
+const LANGUAGE_GROUPS = { hr: 'hr', sr: 'hr', bs: 'hr', it: 'it', en: 'en', sl: 'sl' };
+// Koliko kandidatov enega jezika največ prenesemo in časovno preverimo (prenosi štejejo v dnevno kvoto OpenSubtitles).
+const SYNC_MAX_CANDIDATES = Math.max(1, Math.min(6, Number(process.env.SYNC_MAX_CANDIDATES || 3)));
+// Koliko NOVIH prenosov (brez predpomnilnika) sme porabiti en prevod pri izbiri vira.
+const SYNC_DOWNLOAD_BUDGET = Math.max(1, Math.min(15, Number(process.env.SYNC_DOWNLOAD_BUDGET || 6)));
+// Koliko ročno izbirnih virov na jezik pokažemo v Stremiu.
+const MANUAL_CHOICES_PER_LANGUAGE = Math.max(0, Math.min(8, Number(process.env.MANUAL_CHOICES_PER_LANGUAGE || 4)));
+const SUBTITLE_SYNC_ENABLED = String(process.env.SUBTITLE_SYNC || 'true').toLowerCase() !== 'false';
+
+function languageGroup(code) {
+  return LANGUAGE_GROUPS[String(code || '').toLowerCase()] || String(code || '').toLowerCase();
 }
 
-async function fetchOpenSubtitleForLanguageUnqueued(imdbId, language, videoHash, season, episode) {
-  const headers = await openSubtitlesHeaders();
-  const searchLang = language === 'hr' ? 'hr,srp,bos' : language;
-  const baseParams = { imdb_id: String(imdbId).replace(/^tt/, ''), languages: searchLang, order_by: 'downloads', order_direction: 'desc' };
-  if (season && episode) {
-    baseParams.season_number = season;
-    baseParams.episode_number = episode;
-  }
+function toSubtitleCandidate(item) {
+  const a = item?.attributes || {};
+  const file = a.files?.[0] || {};
+  return {
+    fileId: file.file_id ? String(file.file_id) : null,
+    fileName: String(file.file_name || ''),
+    release: String(a.release || ''),
+    language: String(a.language || '').toLowerCase(),
+    moviehashMatch: a.moviehash_match === true,
+    downloads: Number(a.download_count || 0),
+    fps: Number(a.fps || 0),
+    hearingImpaired: Boolean(a.hearing_impaired),
+    machineTranslated: Boolean(a.ai_translated || a.machine_translated),
+    trusted: Boolean(a.from_trusted)
+  };
+}
 
-  if (videoHash) {
+function baseOpenSubtitlesParams(imdbId, season, episode) {
+  const params = { imdb_id: String(imdbId).replace(/^tt/, ''), order_by: 'download_count', order_direction: 'desc' };
+  if (season && episode) {
+    params.season_number = season;
+    params.episode_number = episode;
+  }
+  return params;
+}
+
+async function searchOpenSubtitles(params) {
+  return withOpenSubtitlesLimit(async () => {
+    const headers = await openSubtitlesHeaders();
+    const response = await axios.get(`${OPENSUBTITLES_API}/subtitles`, { headers, params, timeout: 15000 });
+    return (response.data?.data || []).map(toSubtitleCandidate).filter(c => c.fileId);
+  });
+}
+
+const downloadedSubtitleFiles = new Map();
+
+function openSubtitlesFilePath(fileId) {
+  return path.join(CACHE_DIR, 'opensubtitles', `${String(fileId).replace(/[^0-9a-z_-]/gi, '_')}.srt`);
+}
+
+function isSubtitleFileCached(fileId) {
+  return downloadedSubtitleFiles.has(String(fileId)) || fs.existsSync(openSubtitlesFilePath(fileId));
+}
+
+// Prenos z diskovnim predpomnilnikom, da ista datoteka ne porabi kvote dvakrat.
+function downloadOpenSubtitleFile(fileId) {
+  const id = String(fileId);
+  if (downloadedSubtitleFiles.has(id)) return downloadedSubtitleFiles.get(id);
+  const job = (async () => {
+    const filePath = openSubtitlesFilePath(id);
     try {
-      const hashSearch = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
-        headers,
-        params: { ...baseParams, moviehash: videoHash, moviehash_match: 'only' }
-      });
-      const hashResult = hashSearch.data.data?.[0];
-      const hashFile = hashResult?.attributes?.files?.[0];
-      const fileName = hashFile?.file_name || `${imdbId}.${language}.srt`;
-      const verifiedMatch = hashResult?.attributes?.moviehash_match !== false;
-      if (hashFile?.file_id && verifiedMatch) {
-        const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: hashFile.file_id }, { headers });
-        if (download.data.link) {
-          const srt = (await axios.get(download.data.link)).data;
-          return { srt, language, fileName, matchedByHash: true };
-        }
+      if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf8');
+    } catch (_) {}
+    const srt = await withOpenSubtitlesLimit(async () => {
+      const headers = await openSubtitlesHeaders();
+      const download = await axios.post(`${OPENSUBTITLES_API}/download`, { file_id: Number(id) || id }, { headers });
+      if (!download.data?.link) throw new Error(`OpenSubtitles ni vrnil povezave za datoteko ${id}`);
+      const file = await axios.get(download.data.link, { responseType: 'text', transformResponse: body => body });
+      return String(file.data || '');
+    });
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, srt, 'utf8');
+    } catch (err) {
+      console.warn(`[opensubtitles] datoteke ${id} ni bilo mogoče shraniti: ${err.message}`);
+    }
+    return srt;
+  })();
+  downloadedSubtitleFiles.set(id, job);
+  job.catch(() => downloadedSubtitleFiles.delete(id));
+  return job;
+}
+
+function releaseSourceFamily(name) {
+  const n = String(name || '').toLowerCase();
+  if (/blu-?ray|bdrip|brrip|bdremux|\bbd(?:25|50)?\b|remux/.test(n)) return 'bluray';
+  if (/web-?dl|web-?rip|\bweb\b|\bamzn\b|\bnf\b|\bdsnp\b|\bhmax\b|\batvp\b|\bhulu\b|\bmax\b/.test(n)) return 'web';
+  if (/hdtv|pdtv|\btvrip\b/.test(n)) return 'tv';
+  if (/dvd/.test(n)) return 'dvd';
+  return null;
+}
+
+function releaseGroupName(name) {
+  const stripped = String(name || '').replace(/\.(srt|sub|ass|ssa|vtt|mkv|mp4|avi|m4v|ts)$/i, '').replace(/\[[^\]]*\]$/, '').trim();
+  const match = stripped.match(/-([a-z0-9]{2,})$/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function releaseEditionTags(name) {
+  const n = String(name || '').toLowerCase();
+  const tags = new Set();
+  if (/extended/.test(n)) tags.add('extended');
+  if (/director'?s?.?cut|\bdc\b/.test(n)) tags.add('directors');
+  if (/unrated|uncut/.test(n)) tags.add('unrated');
+  if (/theatrical/.test(n)) tags.add('theatrical');
+  if (/\bimax\b/.test(n)) tags.add('imax');
+  return tags;
+}
+
+function releaseTokens(name) {
+  return new Set(String(name || '').toLowerCase().replace(/\.(srt|sub|mkv|mp4|avi)$/i, '').split(/[^a-z0-9]+/).filter(token => token.length >= 2));
+}
+
+// Ocena kandidata samo iz metapodatkov (brez prenosa). Višje = bolje.
+function scoreSubtitleCandidate(candidate, videoFileName) {
+  let score = 0;
+  if (candidate.moviehashMatch) score += 100;
+  // Strojno preveden vir bi Gemini prevajal "prevod prevoda" - le v skrajni sili.
+  if (candidate.machineTranslated) score -= 80;
+  if (candidate.trusted) score += 5;
+  score += Math.min(10, Math.log10(1 + candidate.downloads) * 2.5);
+
+  const video = String(videoFileName || '');
+  if (video) {
+    const names = `${candidate.release} ${candidate.fileName}`;
+    const videoFamily = releaseSourceFamily(video);
+    const subFamily = releaseSourceFamily(names);
+    if (videoFamily && subFamily) score += videoFamily === subFamily ? 15 : -10;
+
+    const videoGroup = releaseGroupName(video);
+    if (videoGroup && [candidate.release, candidate.fileName].some(n => releaseGroupName(n) === videoGroup || releaseTokens(n).has(videoGroup))) score += 20;
+
+    const videoEdition = [...releaseEditionTags(video)].sort().join(',');
+    const subEdition = [...releaseEditionTags(names)].sort().join(',');
+    if (videoEdition !== subEdition) score -= 15;
+
+    const a = releaseTokens(video);
+    const b = releaseTokens(names);
+    let common = 0;
+    for (const token of a) if (b.has(token)) common++;
+    const union = a.size + b.size - common;
+    if (union > 0) score += (common / union) * 20;
+  }
+  return score;
+}
+
+function rankSubtitleCandidates(candidates, videoFileName) {
+  return [...candidates]
+    .map(c => ({ ...c, metaScore: scoreSubtitleCandidate(c, videoFileName) }))
+    .sort((a, b) => b.metaScore - a.metaScore);
+}
+
+function candidateLabel(candidate) {
+  const name = candidate.release || candidate.fileName || `datoteka ${candidate.fileId}`;
+  return name.length > 60 ? `${name.slice(0, 57)}...` : name;
+}
+
+// Kontekst ene izbire vira: hash zadetki, referenca in proračun prenosov.
+function createSourceSelection({ imdbId, videoHash, videoFileName, season, episode }) {
+  let hashSearch = null;
+  let referencePromise = null;
+  const selection = {
+    imdbId,
+    videoHash,
+    videoFileName,
+    season,
+    episode,
+    budget: SYNC_DOWNLOAD_BUDGET,
+
+    hashMatches() {
+      if (!videoHash) return Promise.resolve([]);
+      if (!hashSearch) {
+        hashSearch = searchOpenSubtitles({ ...baseOpenSubtitlesParams(imdbId, season, episode), moviehash: videoHash, moviehash_match: 'only' })
+          .then(list => list.filter(c => c.moviehashMatch))
+          .catch(error => {
+            console.warn(`[sync] iskanje po hashu (${imdbId}) ni uspelo: ${error.message}`);
+            return [];
+          });
       }
+      return hashSearch;
+    },
+
+    // Referenčna časovnica: podnapis, ki se ujema s hashem videa (jezik ni pomemben).
+    reference() {
+      if (!SUBTITLE_SYNC_ENABLED || !videoHash) return Promise.resolve(null);
+      if (!referencePromise) {
+        referencePromise = (async () => {
+          const matches = await selection.hashMatches();
+          const order = ['en', 'hr', 'it', 'sl'];
+          const ranked = [...matches].sort((a, b) => {
+            if (a.machineTranslated !== b.machineTranslated) return a.machineTranslated ? 1 : -1;
+            const ra = order.indexOf(languageGroup(a.language)); const rb = order.indexOf(languageGroup(b.language));
+            const oa = ra < 0 ? order.length : ra; const ob = rb < 0 ? order.length : rb;
+            return oa - ob || b.downloads - a.downloads;
+          });
+          for (const candidate of ranked.slice(0, 2)) {
+            try {
+              const srt = await selection.download(candidate);
+              if (subsync.extractCues(srt).length >= subsync.DEFAULT_THRESHOLDS.minMatches) {
+                console.log(`[sync] referenčna časovnica: ${candidate.language} "${candidateLabel(candidate)}" (ujema se s hashem videa)`);
+                return { srt, candidate };
+              }
+            } catch (error) {
+              console.warn(`[sync] referenčne datoteke ${candidate.fileId} ni bilo mogoče prenesti: ${error.message}`);
+            }
+          }
+          return null;
+        })();
+      }
+      return referencePromise;
+    },
+
+    async download(candidate) {
+      const cached = isSubtitleFileCached(candidate.fileId);
+      if (!cached) {
+        if (selection.budget <= 0) throw new Error('porabljen proračun prenosov za to izbiro');
+        selection.budget -= 1;
+      }
+      return downloadOpenSubtitleFile(candidate.fileId);
+    }
+  };
+  return selection;
+}
+
+// Časovno preveri (in po potrebi popravi) en podnapis glede na referenco.
+async function syncAgainstReference(selection, srt, label) {
+  const reference = await selection.reference();
+  if (!reference) return { srt, sync: null, verified: false };
+  if (reference.candidate && label && label.fileId && reference.candidate.fileId === label.fileId) {
+    return { srt, sync: { ok: true, inSync: true, score: 1 }, verified: true };
+  }
+  const result = subsync.computeSync(reference.srt, srt);
+  const name = label ? candidateLabel(label) : 'podnapis';
+  console.log(`[sync] ${name}: ${subsync.describeSync(result)}`);
+  if (!result.ok) return { srt, sync: result, verified: false };
+  return { srt: subsync.applySync(srt, result.scale, result.offsetMs), sync: result, verified: true };
+}
+
+// Izbere najboljši podnapis enega jezika. Vrne null, če v tem jeziku ni nič.
+async function selectSubtitleForLanguage(selection, language) {
+  const { imdbId, season, episode, videoFileName } = selection;
+  const hashMatches = (await selection.hashMatches()).filter(c => languageGroup(c.language) === language && !c.machineTranslated);
+  if (hashMatches.length) {
+    const best = rankSubtitleCandidates(hashMatches, videoFileName)[0];
+    try {
+      const srt = await selection.download(best);
+      console.log(`[sync] ${language}: "${candidateLabel(best)}" se ujema s hashem videa - časovnica je že pravilna`);
+      return { srt, language, fileName: best.fileName || `${imdbId}.${language}.srt`, candidate: best, matchedByHash: true, verified: true, sync: { ok: true, inSync: true, score: 1 } };
     } catch (error) {
-      console.warn(`[opensubtitles] hash search failed for ${imdbId} (${language}): ${error.message}`);
+      console.warn(`[sync] ${language}: prenos hash zadetka ni uspel: ${error.message}`);
     }
   }
 
-  const search = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', { headers, params: baseParams });
-  const result = search.data.data?.[0];
-  const file = result?.attributes?.files?.[0];
-  const fileName = file?.file_name || `${imdbId}.${language}.srt`;
-  if (!file?.file_id) return null;
-  const download = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: file.file_id }, { headers });
-  if (!download.data.link) return null;
-  const srt = (await axios.get(download.data.link)).data;
-  return { srt, language, fileName, matchedByHash: false };
+  const candidates = await searchOpenSubtitles({ ...baseOpenSubtitlesParams(imdbId, season, episode), languages: OPENSUBTITLES_LANGUAGE_CODES[language] || language });
+  if (!candidates.length) return null;
+  const ranked = rankSubtitleCandidates(candidates, videoFileName);
+  const reference = await selection.reference();
+
+  let fallback = null;
+  let best = null;
+  const toCheck = reference ? ranked.slice(0, SYNC_MAX_CANDIDATES) : ranked.slice(0, 1);
+  for (const candidate of toCheck) {
+    let srt;
+    try {
+      srt = await selection.download(candidate);
+    } catch (error) {
+      console.warn(`[sync] ${language}: "${candidateLabel(candidate)}" ni bil prenesen: ${error.message}`);
+      if (/proračun/.test(error.message)) break;
+      continue;
+    }
+    if (!reference) {
+      return { srt, language, fileName: candidate.fileName || `${imdbId}.${language}.srt`, candidate, matchedByHash: false, verified: false, sync: null };
+    }
+    const checked = await syncAgainstReference(selection, srt, candidate);
+    const entry = { ...checked, language, fileName: candidate.fileName || `${imdbId}.${language}.srt`, candidate, matchedByHash: false };
+    if (!fallback) fallback = entry;
+    if (checked.verified && (!best || checked.sync.score > best.sync.score)) best = entry;
+    // Zelo dobro ujemanje: ni treba trošiti prenosov za ostale kandidate.
+    if (best && best.sync.score >= 0.8) break;
+  }
+  return best || fallback;
+}
+
+// Ročno izbran podnapis (po file_id): ne iščemo drugih, ga pa vseeno uskladimo z referenco.
+async function loadChosenSubtitle(selection, language, fileId, fileName) {
+  const candidate = { fileId: String(fileId), fileName: fileName || '', release: fileName || '', language };
+  const srt = await downloadOpenSubtitleFile(fileId);
+  const checked = await syncAgainstReference(selection, srt, candidate);
+  return { ...checked, language, fileName: fileName || `opensubtitles-${fileId}.srt`, candidate, matchedByHash: false };
+}
+
+function syncNoticeSuffix(found) {
+  if (!found) return '';
+  if (found.matchedByHash) return ' Časovnica: ujema se z vašo datoteko.';
+  if (found.verified && found.sync && !found.sync.inSync) return ' Časovnica: samodejno usklajena.';
+  if (found.verified) return ' Časovnica: preverjena.';
+  if (found.sync) return ' Časovnica: ni potrjena.';
+  return '';
+}
+
+// Združljivost: prejšnji vmesnik (en jezik, vrne { srt, language, fileName, matchedByHash }).
+async function fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode, videoFileName) {
+  const selection = createSourceSelection({ imdbId, videoHash, videoFileName, season, episode });
+  return selectSubtitleForLanguage(selection, language);
 }
 
 function prependNoticeCue(srtText, noticeMessage) {
@@ -664,14 +943,27 @@ function prependNoticeCue(srtText, noticeMessage) {
   return `${noticeCue}${cleanBody.trimStart()}`;
 }
 
-async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode) {
+async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, strict, season, episode, options = {}) {
   if (!process.env.OPENSUBTITLES_API_KEY) throw new Error('OPENSUBTITLES_API_KEY is not configured');
+  const selection = createSourceSelection({ imdbId, videoHash, videoFileName: options.videoFileName, season, episode });
+
+  // Ročna izbira: uporabnik je v Stremiu izbral točno določen izvorni podnapis.
+  if (options.fileId) {
+    const chosen = await loadChosenSubtitle(selection, requestedLanguage, options.fileId, options.fileName);
+    console.log(`[Subtitles] Ročno izbran vir (${requestedLanguage}): ${chosen.fileName}`);
+    return { ...chosen, isNativeSlovene: false, manual: true };
+  }
+
+  const reference = await selection.reference();
+  let fallback = null;
 
   // Vedno najprej preverimo, ali že obstajajo originalni slovenski podnapisi na internetu
   try {
-    const sloveneFound = await fetchOpenSubtitleForLanguage(imdbId, 'sl', videoHash, season, episode);
+    const sloveneFound = await selectSubtitleForLanguage(selection, 'sl');
     if (sloveneFound) {
-      return { ...sloveneFound, isNativeSlovene: true };
+      if (sloveneFound.verified || !reference) return { ...sloveneFound, isNativeSlovene: true };
+      console.log('[sync] slovenski podnapisi obstajajo, a se ne ujemajo z videom - najprej poskusim s potrjenim prevodom');
+      fallback = { ...sloveneFound, isNativeSlovene: true };
     }
   } catch (error) {
     console.warn(`[opensubtitles] preverjanje obstoječih slovenskih podnapisov (${imdbId}) ni uspelo: ${error.message}`);
@@ -680,13 +972,46 @@ async function fetchOpenSubtitle(imdbId, meta, requestedLanguage, videoHash, str
   const languages = resolveSourceLanguages(meta, requestedLanguage, strict);
   for (const language of languages) {
     try {
-      const found = await fetchOpenSubtitleForLanguage(imdbId, language, videoHash, season, episode);
-      if (found) return { ...found, isNativeSlovene: false };
+      const found = await selectSubtitleForLanguage(selection, language);
+      if (!found) continue;
+      const result = { ...found, isNativeSlovene: false };
+      // Brez reference ničesar ne moremo preveriti, zato velja jezikovna prioriteta.
+      if (found.verified || !reference) return result;
+      if (!fallback) fallback = result;
+      console.log(`[sync] ${language}: noben kandidat ni časovno potrjen - preverim naslednji jezik`);
     } catch (error) {
       console.warn(`[opensubtitles] ${imdbId} (${language}) failed: ${error.message}`);
     }
   }
+  if (fallback) {
+    console.warn(`[sync] ${imdbId}: noben vir ni časovno potrjen, uporabljam najboljšega po imenu izdaje (${fallback.fileName})`);
+    return fallback;
+  }
   throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
+}
+
+// Seznam virov za ročno izbiro v Stremiu (samo iskanje, brez prenosov).
+const manualChoiceCache = new Map();
+async function listManualSourceChoices(imdbId, season, episode, videoFileName) {
+  if (!process.env.OPENSUBTITLES_API_KEY || MANUAL_CHOICES_PER_LANGUAGE <= 0) return [];
+  const key = `${imdbId}:${season || ''}:${episode || ''}`;
+  const cached = manualChoiceCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return pickManualChoices(cached.candidates, videoFileName);
+  const languages = [...new Set(SUPPORTED_SOURCE_LANGUAGES.flatMap(l => (OPENSUBTITLES_LANGUAGE_CODES[l] || l).split(',')))].join(',');
+  const candidates = await searchOpenSubtitles({ ...baseOpenSubtitlesParams(imdbId, season, episode), languages });
+  manualChoiceCache.set(key, { candidates, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
+  return pickManualChoices(candidates, videoFileName);
+}
+
+function pickManualChoices(candidates, videoFileName) {
+  const choices = [];
+  for (const language of SUPPORTED_SOURCE_LANGUAGES) {
+    const ofLanguage = candidates.filter(c => languageGroup(c.language) === language);
+    for (const candidate of rankSubtitleCandidates(ofLanguage, videoFileName).slice(0, MANUAL_CHOICES_PER_LANGUAGE)) {
+      choices.push({ ...candidate, sourceLanguage: language });
+    }
+  }
+  return choices;
 }
 
 // ---------- 3. VRHUNSKI PREVOD Z GEMINI ----------
@@ -1185,25 +1510,50 @@ function parseExtraHash(extra) {
   };
 }
 
-async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, season, episode) {
-  const key = buildCacheKey(imdbId, sourceLanguage, videoHash, season, episode);
+// Ime video datoteke, ki ga Stremio pošlje v "extra" (filename=...).
+function parseExtraFileName(extra) {
+  const match = String(extra || '').match(/(?:^|&)filename=([^&]+)/i);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1].replace(/\+/g, ' '));
+  } catch (_) {
+    return match[1];
+  }
+}
+
+// Ročno izbran vir dobi svoj ključ, da ne prepiše (ali ne prebere) samodejnega prevoda.
+function sourceCacheLanguage(sourceLanguage, options = {}) {
+  return options.fileId ? `${sourceLanguage}-file${String(options.fileId).replace(/[^0-9a-z]/gi, '')}` : sourceLanguage;
+}
+
+async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, season, episode, options = {}) {
+  const key = buildCacheKey(imdbId, sourceCacheLanguage(sourceLanguage, options), videoHash, season, episode);
   const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) {
     const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
     console.log(`[Subtitles] ${notice} (${imdbId})`);
     return prependNoticeCue(cached.srt, notice);
   }
-  const localDiskSrt = loadSlovenianSrtFile(imdbId, season, episode);
+  // Prej shranjena .sl.srt datoteka (ne pri ročni izbiri, ki zahteva nov prevod).
+  const localDiskSrt = options.fileId ? null : loadSlovenianSrtFile(imdbId, season, episode);
   if (localDiskSrt) {
     const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
     console.log(`[Subtitles] ${notice} (${imdbId})`);
-    return prependNoticeCue(localDiskSrt, notice);
+    if (!videoHash || !SUBTITLE_SYNC_ENABLED || !process.env.OPENSUBTITLES_API_KEY) return prependNoticeCue(localDiskSrt, notice);
+    // Shranjen prevod je lahko narejen za drugo izdajo videa: uskladimo ga s časovnico te datoteke.
+    const selection = createSourceSelection({ imdbId, videoHash, videoFileName: options.videoFileName, season, episode });
+    const aligned = await syncAgainstReference(selection, localDiskSrt, null).catch(() => ({ srt: localDiskSrt }));
+    const entry = { srt: prependNoticeCue(aligned.srt, notice), expiresAt: Date.now() + CACHE_TTL_MS };
+    cache.set(key, entry);
+    saveCacheEntryToDisk(key, entry);
+    return entry.srt;
   }
   if (inflight.has(key)) return inflight.get(key);
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`, season, episode);
-    const { srt: rawSource, language: usedLanguage, fileName: sourceFileName, matchedByHash, isNativeSlovene } = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode);
+    const found = await fetchOpenSubtitle(imdbId, meta, sourceLanguage, videoHash, strict, season, episode, options);
+    const { srt: rawSource, language: usedLanguage, fileName: sourceFileName, matchedByHash, isNativeSlovene } = found;
 
     // Če že obstajajo originalni slovenski podnapisi, jih le očistimo (SDH) in postrežemo brez AI prevajanja
     if (isNativeSlovene) {
@@ -1218,19 +1568,27 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     }
 
     // 1. Izpis izbranega jezika in datoteke
-    const sourceNotice = getTranslationNotice(usedLanguage);
+    const sourceNotice = `${getTranslationNotice(usedLanguage)}${found.manual ? ' Ročno izbran vir.' : ''}${syncNoticeSuffix(found)}`;
     console.log(`[Subtitles] ${sourceNotice} (${sourceFileName || `${imdbId}.${usedLanguage}.srt`})`);
 
-    if (!matchedByHash) {
+    if (!matchedByHash && !found.manual) {
       const genericKey = buildCacheKey(imdbId, usedLanguage, null, season, episode);
       const genericCached = cache.get(genericKey);
       if (genericCached && genericCached.expiresAt > Date.now()) {
         const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
         console.log(`[Subtitles] ${notice} (${imdbId}): reusing existing translation`);
-        cache.set(key, genericCached);
-        saveCacheEntryToDisk(key, genericCached);
-        saveSlovenianSrtFile(imdbId, season, episode, genericCached.srt);
-        return prependNoticeCue(genericCached.srt, notice);
+        // Obstoječi prevod je bil morda narejen za drugo izdajo: časovnico uskladimo z izbranim virom.
+        let reusedSrt = genericCached.srt;
+        const aligned = subsync.computeSync(rawSource, reusedSrt);
+        if (aligned.ok && !aligned.inSync) {
+          console.log(`[sync] ponovno uporabljen prevod: ${subsync.describeSync(aligned)}`);
+          reusedSrt = subsync.applySync(reusedSrt, aligned.scale, aligned.offsetMs);
+        }
+        const reusedEntry = { srt: reusedSrt, expiresAt: genericCached.expiresAt };
+        cache.set(key, reusedEntry);
+        saveCacheEntryToDisk(key, reusedEntry);
+        saveSlovenianSrtFile(imdbId, season, episode, reusedSrt);
+        return prependNoticeCue(reusedSrt, notice);
       }
     }
 
@@ -1301,8 +1659,8 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     saveCacheEntryToDisk(key, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
     saveSlovenianSrtFile(imdbId, season, episode, finalSrtWithNotice);
 
-    if (!matchedByHash) {
-      const genericKey = buildCacheKey(imdbId, usedLanguage, null);
+    if (!matchedByHash && !found.manual) {
+      const genericKey = buildCacheKey(imdbId, usedLanguage, null, season, episode);
       cache.set(genericKey, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
       saveCacheEntryToDisk(genericKey, { srt: finalSrtWithNotice, expiresAt: Date.now() + CACHE_TTL_MS });
     }
@@ -1605,20 +1963,28 @@ function createApp() {
     const videoHash = req.query.hash ? String(req.query.hash) : null;
     const season = req.query.season ? String(req.query.season) : null;
     const episode = req.query.episode ? String(req.query.episode) : null;
+    const fileId = req.query.fileId && /^\d+$/.test(String(req.query.fileId)) ? String(req.query.fileId) : null;
+    const options = {
+      fileId,
+      fileName: req.query.source ? String(req.query.source).slice(0, 200) : null,
+      videoFileName: req.query.file ? String(req.query.file).slice(0, 300) : null
+    };
 
     if (lang === 'choose') {
       return res.type('application/x-subrip; charset=utf-8').send(CHOOSE_PLACEHOLDER_SRT);
     }
     if (!SUPPORTED_SOURCE_LANGUAGES.includes(lang)) return res.sendStatus(404);
 
-    const key = buildCacheKey(imdbId, lang, videoHash, season, episode);
+    const key = buildCacheKey(imdbId, sourceCacheLanguage(lang, options), videoHash, season, episode);
 
     const finalEntry = cache.get(key);
     if (finalEntry && finalEntry.expiresAt > Date.now()) {
       const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
       return res.type('application/x-subrip; charset=utf-8').send(prependNoticeCue(finalEntry.srt, notice));
     }
-    const localDiskSrt = loadSlovenianSrtFile(imdbId, season, episode);
+    // Brez hasha shranjene datoteke ne moremo uskladiti, zato jo postrežemo takoj (kot doslej).
+    // S hashem gre skozi translateSubtitle, ki jo časovno uskladi s to izdajo videa.
+    const localDiskSrt = fileId || videoHash ? null : loadSlovenianSrtFile(imdbId, season, episode);
     if (localDiskSrt) {
       const notice = 'Naloženi že prej prevedeni slovenski podnapisi.';
       return res.type('application/x-subrip; charset=utf-8').send(prependNoticeCue(localDiskSrt, notice));
@@ -1626,8 +1992,10 @@ function createApp() {
 
     // Zaženemo prevod / iskanje slovenskih podnapisov
     try {
-      // strict = false omogoča samodejni prehod na naslednje jezike po prioriteti (HR -> IT -> EN)
-      translateSubtitle(imdbId, lang, videoHash, false, season, episode).catch(err => {
+      // strict = false omogoča samodejni prehod na naslednje jezike po prioriteti (HR -> IT -> EN);
+      // pri ročni izbiri (fileId) je vir točno določen.
+      const translation = translateSubtitle(imdbId, lang, videoHash, Boolean(fileId), season, episode, options);
+      translation.catch(err => {
         console.error(`[translation] ${imdbId}: ${err.message}`);
       });
 
@@ -1668,13 +2036,14 @@ function createApp() {
     return res.type('application/x-subrip; charset=utf-8').send(buildPlaceholderSrt(lang));
   });
 
-  app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, (req, res) => {
+  app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, async (req, res) => {
     console.log(`[subtitle] type=${req.params[0]} id=${req.params[1]} extra=${req.params[2] || ''}`);
     const type = req.params[0];
     const rawId = req.params[1].replace(/\.json$/i, '');
     const { imdbId, season, episode } = parseSeriesId(rawId);
     const explicitLanguage = req.query.sourceLanguage ? String(req.query.sourceLanguage).toLowerCase() : null;
     const videoHash = parseExtraHash(req.params[2]).videoHash;
+    const videoFileName = parseExtraFileName(req.params[2]);
     const root = baseUrl || `${req.protocol}://${req.get('host')}`;
 
     const sourceLangLabel = {
@@ -1684,22 +2053,52 @@ function createApp() {
     };
     const extraQuery = [
       videoHash ? `hash=${encodeURIComponent(videoHash)}` : null,
-      season && episode ? `season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}` : null
+      season && episode ? `season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}` : null,
+      videoFileName ? `file=${encodeURIComponent(videoFileName)}` : null
     ].filter(Boolean).join('&');
     const queryString = extraQuery ? `?${extraQuery}` : '';
 
     const buildUrl = lang => `${root}/subtitle-file/${encodeURIComponent(imdbId)}/${lang}.srt${queryString}`;
+    const buildChoiceUrl = choice => {
+      const params = `fileId=${encodeURIComponent(choice.fileId)}&source=${encodeURIComponent(choice.release || choice.fileName || '')}`;
+      return `${buildUrl(choice.sourceLanguage)}${queryString ? '&' : '?'}${params}`;
+    };
+
+    // Dodatni vnosi za ročni ponovni prevod iz točno določenega podnapisa.
+    // Seznam je le iskanje (brez prenosov), z omejenim časom, da Stremio ne čaka.
+    async function manualChoiceEntries(languages) {
+      try {
+        const choices = await Promise.race([
+          listManualSourceChoices(imdbId, season, episode, videoFileName),
+          new Promise(resolve => setTimeout(() => resolve([]), 4000))
+        ]);
+        const counters = {};
+        return choices
+          .filter(choice => languages.includes(choice.sourceLanguage))
+          .map(choice => ({
+            id: `slo-ai-${type}-${imdbId}-${choice.sourceLanguage}-file${choice.fileId}`,
+            url: buildChoiceUrl(choice),
+            lang: 'slv',
+            label: `Ponovni prevod iz ${choice.sourceLanguage === 'en' ? 'ANG' : choice.sourceLanguage.toUpperCase()} #${(counters[choice.sourceLanguage] = (counters[choice.sourceLanguage] || 0) + 1)}: ${candidateLabel(choice)}`
+          }));
+      } catch (error) {
+        console.warn(`[subtitle] seznama virov za ročno izbiro ni bilo mogoče pripraviti: ${error.message}`);
+        return [];
+      }
+    }
 
     if (explicitLanguage && SUPPORTED_SOURCE_LANGUAGES.includes(explicitLanguage)) {
       const id = `slo-ai-${type}-${imdbId}-${explicitLanguage}`;
       const label = sourceLangLabel[explicitLanguage] || `Prevod iz ${explicitLanguage.toUpperCase()}`;
-      return res.json({ subtitles: [{ id, url: buildUrl(explicitLanguage), lang: 'slv', label }] });
+      const manual = await manualChoiceEntries([explicitLanguage]);
+      return res.json({ subtitles: [{ id, url: buildUrl(explicitLanguage), lang: 'slv', label }, ...manual] });
     }
 
     const subtitles = [
       { id: `slo-ai-${type}-${imdbId}-hr`, url: buildUrl('hr'), lang: 'slv', label: 'Prevod iz HR' },
       { id: `slo-ai-${type}-${imdbId}-it`, url: buildUrl('it'), lang: 'slv', label: 'Prevod iz IT' },
-      { id: `slo-ai-${type}-${imdbId}-en`, url: buildUrl('en'), lang: 'slv', label: 'Prevod iz ANG' }
+      { id: `slo-ai-${type}-${imdbId}-en`, url: buildUrl('en'), lang: 'slv', label: 'Prevod iz ANG' },
+      ...await manualChoiceEntries(SUPPORTED_SOURCE_LANGUAGES)
     ];
 
     return res.json({ subtitles });
@@ -1791,5 +2190,13 @@ module.exports = {
   withOpenSubtitlesLimit,
   fetchOpenSubtitleForLanguage,
   shiftSrtTimings,
-  autoDetectSyncOffset
+  autoDetectSyncOffset,
+  parseExtraFileName,
+  sourceCacheLanguage,
+  scoreSubtitleCandidate,
+  rankSubtitleCandidates,
+  pickManualChoices,
+  releaseSourceFamily,
+  releaseGroupName,
+  syncNoticeSuffix
 };
