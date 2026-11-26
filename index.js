@@ -102,7 +102,7 @@ const partials = new Map();
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.8.0',
+  version: '0.8.1',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -1851,7 +1851,7 @@ function createPartialTracker(sourceEntries, totalChunks) {
 
 function mergeChunkIntoPartial(partial, entries, chunkIndex) {
   for (const entry of entries) {
-    const stored = { timecode: entry.timecode, text: entry.text };
+    const stored = { timecode: entry.timecode, text: entry.text, translated: true };
     if (entry.meta) stored.meta = entry.meta;
     partial.entryMap.set(entry.id, stored);
   }
@@ -1873,6 +1873,34 @@ function partialToSrt(partial) {
     return { id, timecode: entry.timecode, text: entry.text };
   });
   return toSrt(entries);
+}
+
+// Delni prevod za predvajalnik: obvestilo, koliko je prevedeno, in oznaka na začetku vsakega
+// še neprevedenega dela (tam je zaenkrat besedilo vira), da uporabnik ve, da mora podnapise
+// po koncu prevoda izbrati znova. Predvajalnik datoteke sam od sebe ne naloži ponovno.
+const IN_PROGRESS_MARK = '[Prevod še poteka - znova izberite podnapise]';
+
+function partialProgressSrt(partial) {
+  let inGap = false;
+  const entries = partial.order.map(id => {
+    const entry = partial.entryMap.get(id);
+    let text = entry.text;
+    if (entry.translated) {
+      inGap = false;
+    } else {
+      if (!inGap) text = `${IN_PROGRESS_MARK}\n${text}`;
+      inGap = true;
+    }
+    return { id, timecode: entry.timecode, text };
+  });
+  const done = partial.doneChunkIndices.size;
+  const notice = `Prevod še poteka (${done}/${partial.totalChunks} delov). Ko bo končan, znova izberite podnapise.`;
+  return prependNoticeCue(toSrt(entries), notice);
+}
+
+function inProgressPlaceholderSrt() {
+  // Dolgo obvestilo, da je vidno kadarkoli med ogledom.
+  return `0\n00:00:01,000 --> 09:59:59,000\n${IN_PROGRESS_MARK}\nPrevod se pripravlja (1-2 min).`;
 }
 
 // ---------- 4. Shranjevanje rezultata v .sl.srt datoteko ----------
@@ -2143,23 +2171,27 @@ function createApp() {
       // strict = false omogoča samodejni prehod na naslednje jezike po prioriteti (HR -> IT -> EN);
       // pri ročni izbiri (fileId) je vir točno določen.
       const translation = translateSubtitle(imdbId, lang, videoHash, Boolean(fileId), season, episode, options);
+      let failure = null;
       translation.catch(err => {
+        failure = err;
         console.error(`[translation] ${imdbId}: ${err.message}`);
       });
 
       // Takoj ko je preveden 1. chunk (ali celoten film), postrežemo podnapise brez čakanja!
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline) {
+        if (failure && !cache.get(key) && !partials.get(key)) {
+          res.set('Cache-Control', 'no-store');
+          return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(failure.message));
+        }
         const full = cache.get(key);
         if (full && full.srt) {
           return res.type('application/x-subrip; charset=utf-8').send(full.srt);
         }
         const partial = partials.get(key);
         if (partial && partial.doneChunkIndices && partial.doneChunkIndices.size >= 1) {
-          const body = partialToSrt(partial);
-          const notice = partial.sourceNotice || getTranslationNotice(lang);
-          const combined = prependNoticeCue(body, notice);
-          return res.type('application/x-subrip; charset=utf-8').send(combined);
+          res.set('Cache-Control', 'no-store');
+          return res.type('application/x-subrip; charset=utf-8').send(partialProgressSrt(partial));
         }
         await new Promise(resolve => setTimeout(resolve, 400));
       }
@@ -2168,12 +2200,10 @@ function createApp() {
       return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(error.message));
     }
 
+    res.set('Cache-Control', 'no-store');
     const partial = partials.get(key);
-    if (partial) {
-      const body = partialToSrt(partial);
-      const notice = partial.sourceNotice || buildPlaceholderSrt(lang);
-      const combined = prependNoticeCue(body, notice);
-      return res.type('application/x-subrip; charset=utf-8').send(combined);
+    if (partial && partial.doneChunkIndices && partial.doneChunkIndices.size >= 1) {
+      return res.type('application/x-subrip; charset=utf-8').send(partialProgressSrt(partial));
     }
 
     const job = jobs.get(key);
@@ -2181,7 +2211,7 @@ function createApp() {
       return res.status(503).type('application/x-subrip; charset=utf-8').send(buildErrorSrt(job.error));
     }
 
-    return res.type('application/x-subrip; charset=utf-8').send(buildPlaceholderSrt(lang));
+    return res.type('application/x-subrip; charset=utf-8').send(inProgressPlaceholderSrt());
   });
 
   app.get(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/([^/]+?))?$/, async (req, res) => {
@@ -2308,6 +2338,8 @@ module.exports = {
   mergeChunkIntoPartial,
   markChunkFailed,
   partialToSrt,
+  partialProgressSrt,
+  inProgressPlaceholderSrt,
   removeSdh,
   stripSdhFromLine,
   DEFAULT_LANGUAGE_PRIORITY,
