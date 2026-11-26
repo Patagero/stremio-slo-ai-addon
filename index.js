@@ -99,10 +99,13 @@ const inflight = new Map();
 const completed = new Map();
 const jobs = new Map();
 const partials = new Map();
+// Ključ prevoda -> { error, until }: kako dolgo po napaki ne poskušamo znova.
+const recentFailures = new Map();
+const FAILURE_RETRY_MS = Math.max(0, Number(process.env.FAILURE_RETRY_MS || 2 * 60 * 1000));
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.8.1',
+  version: '0.8.2',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -563,10 +566,28 @@ function resolveSourceLanguages(meta, requested, strict) {
 let openSubtitlesToken = null;
 let openSubtitlesLoginPromise = null;
 
+let openSubtitlesCredentialsWarned = false;
+
+// Opis napake OpenSubtitles: status in sporočilo strežnika (npr. "401 Invalid token").
+function openSubtitlesErrorDetail(error) {
+  const status = error?.response?.status;
+  const data = error?.response?.data;
+  let message = '';
+  if (data && typeof data === 'object') message = data.message || (Array.isArray(data.errors) ? data.errors.join('; ') : '') || '';
+  else if (typeof data === 'string') message = data.slice(0, 160);
+  return [status, message || error?.message].filter(Boolean).join(' ');
+}
+
 async function openSubtitlesLogin() {
   const username = process.env.OPENSUBTITLES_USERNAME;
   const password = process.env.OPENSUBTITLES_PASSWORD;
-  if (!username || !password) return null;
+  if (!username || !password) {
+    if (!openSubtitlesCredentialsWarned) {
+      openSubtitlesCredentialsWarned = true;
+      console.warn('[opensubtitles] OPENSUBTITLES_USERNAME/OPENSUBTITLES_PASSWORD nista nastavljena - prenosi so anonimni (OpenSubtitles jih lahko zavrne z 401)');
+    }
+    return null;
+  }
   if (openSubtitlesToken && openSubtitlesToken.expiresAt > Date.now()) return openSubtitlesToken.value;
 
   if (openSubtitlesLoginPromise) return openSubtitlesLoginPromise;
@@ -582,12 +603,18 @@ async function openSubtitlesLogin() {
         }
       });
       const token = response.data?.token;
-      if (!token) return null;
-      openSubtitlesToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000 };
-      console.log('[opensubtitles] logged in, using authenticated (higher-quota) access');
+      if (!token) {
+        console.warn('[opensubtitles] prijava ni vrnila žetona - prenosi so anonimni');
+        return null;
+      }
+      // VIP računi morajo nadaljnje zahteve pošiljati na base_url iz prijave.
+      const baseUrl = String(response.data?.base_url || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      openSubtitlesToken = { value: token, expiresAt: Date.now() + 23 * 60 * 60 * 1000, baseUrl: baseUrl || null };
+      const remaining = response.data?.user?.remaining_downloads ?? response.data?.user?.allowed_downloads;
+      console.log(`[opensubtitles] logged in, using authenticated (higher-quota) access${baseUrl ? ` via ${baseUrl}` : ''}${remaining != null ? `, prenosov danes: ${remaining}` : ''}`);
       return token;
     } catch (error) {
-      console.warn(`[opensubtitles] login failed, falling back to anonymous access: ${error.message}`);
+      console.warn(`[opensubtitles] login failed, falling back to anonymous access: ${openSubtitlesErrorDetail(error)}`);
       return null;
     } finally {
       openSubtitlesLoginPromise = null;
@@ -687,6 +714,13 @@ function isSubtitleFileCached(fileId) {
   return downloadedSubtitleFiles.has(String(fileId)) || fs.existsSync(openSubtitlesFilePath(fileId));
 }
 
+function openSubtitlesDownloadError(error) {
+  const wrapped = new Error(`OpenSubtitles prenos zavrnjen: ${openSubtitlesErrorDetail(error)}`);
+  wrapped.status = error?.response?.status;
+  wrapped.code = 'OPENSUBTITLES_DOWNLOAD';
+  return wrapped;
+}
+
 // Prenos z diskovnim predpomnilnikom, da ista datoteka ne porabi kvote dvakrat.
 function downloadOpenSubtitleFile(fileId) {
   const id = String(fileId);
@@ -697,10 +731,31 @@ function downloadOpenSubtitleFile(fileId) {
       if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf8');
     } catch (_) {}
     const srt = await withOpenSubtitlesLimit(async () => {
-      const headers = await openSubtitlesHeaders();
-      const download = await axios.post(`${OPENSUBTITLES_API}/download`, { file_id: Number(id) || id }, { headers });
+      const requestLink = async () => {
+        const headers = await openSubtitlesHeaders();
+        const api = openSubtitlesToken?.baseUrl ? `https://${openSubtitlesToken.baseUrl}/api/v1` : OPENSUBTITLES_API;
+        return axios.post(`${api}/download`, { file_id: Number(id) || id }, { headers, timeout: 15000 });
+      };
+      let download;
+      try {
+        download = await requestLink();
+      } catch (error) {
+        const status = error?.response?.status;
+        // Neveljaven ali potekel žeton: prijavimo se znova in poskusimo še enkrat.
+        if ((status === 401 || status === 403) && openSubtitlesToken) {
+          console.warn(`[opensubtitles] prenos ${id} zavrnjen (${openSubtitlesErrorDetail(error)}) - ponovna prijava`);
+          openSubtitlesToken = null;
+          try {
+            download = await requestLink();
+          } catch (retryError) {
+            throw openSubtitlesDownloadError(retryError);
+          }
+        } else {
+          throw openSubtitlesDownloadError(error);
+        }
+      }
       if (!download.data?.link) throw new Error(`OpenSubtitles ni vrnil povezave za datoteko ${id}`);
-      const file = await axios.get(download.data.link, { responseType: 'text', transformResponse: body => body });
+      const file = await axios.get(download.data.link, { responseType: 'text', transformResponse: body => body, timeout: 20000 });
       return String(file.data || '');
     });
     try {
@@ -845,13 +900,20 @@ function createSourceSelection({ imdbId, videoHash, videoFileName, season, episo
       return referencePromise;
     },
 
+    downloadError: null,
+
     async download(candidate) {
       const cached = isSubtitleFileCached(candidate.fileId);
       if (!cached) {
         if (selection.budget <= 0) throw new Error('porabljen proračun prenosov za to izbiro');
         selection.budget -= 1;
       }
-      return downloadOpenSubtitleFile(candidate.fileId);
+      try {
+        return await downloadOpenSubtitleFile(candidate.fileId);
+      } catch (error) {
+        if (error.code === 'OPENSUBTITLES_DOWNLOAD') selection.downloadError = error;
+        throw error;
+      }
     }
   };
   return selection;
@@ -994,6 +1056,8 @@ async function selectSourceSubtitle(selection, imdbId, meta, requestedLanguage, 
     console.warn(`[sync] ${imdbId}: noben vir ni časovno potrjen, uporabljam najboljšega po imenu izdaje (${fallback.fileName})`);
     return fallback;
   }
+  // Podnapisi obstajajo, a jih OpenSubtitles ni dovolil prenesti: povemo pravi vzrok.
+  if (selection.downloadError) throw selection.downloadError;
   throw new Error(`No subtitle found in any of: ${languages.join(', ')}`);
 }
 
@@ -1681,6 +1745,10 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     return entry.srt;
   }
   if (inflight.has(key)) return inflight.get(key);
+  // Nedavna napaka (npr. OpenSubtitles 401/429): predvajalnik zahteva datoteko vsako sekundo,
+  // zato napako za kratek čas vrnemo takoj, namesto da vsakič znova kličemo OpenSubtitles.
+  const recentFailure = recentFailures.get(key);
+  if (recentFailure && recentFailure.until > Date.now()) throw recentFailure.error;
 
   const job = (async () => {
     const meta = await tmdbMetadata(`tt${String(imdbId).replace(/^tt/, '')}`, season, episode);
@@ -1816,7 +1884,12 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
 
   inflight.set(key, job);
   try {
-    return await job;
+    const result = await job;
+    recentFailures.delete(key);
+    return result;
+  } catch (error) {
+    recentFailures.set(key, { error, until: Date.now() + FAILURE_RETRY_MS });
+    throw error;
   } finally {
     inflight.delete(key);
   }
@@ -2014,6 +2087,10 @@ function deletePartialFromDisk(key) {
 
 function friendlyErrorMessage(raw) {
   const msg = String(raw || '');
+  if (/OpenSubtitles prenos zavrnjen: 401/i.test(msg)) return 'OpenSubtitles je zavrnil prenos (401). Na strežniku preveri OPENSUBTITLES_USERNAME, OPENSUBTITLES_PASSWORD in OPENSUBTITLES_API_KEY.';
+  if (/OpenSubtitles prenos zavrnjen: 406/i.test(msg)) return 'Dnevna kvota prenosov na OpenSubtitles je porabljena. Poskusi znova jutri.';
+  if (/OpenSubtitles prenos zavrnjen: 429/i.test(msg)) return 'OpenSubtitles trenutno zavrača preveč zahtev. Poskusi znova čez minuto.';
+  if (/OpenSubtitles prenos zavrnjen/i.test(msg)) return `Podnapisov ni bilo mogoče prenesti z OpenSubtitles (${msg.replace(/^.*zavrnjen:\s*/i, '').slice(0, 80)}).`;
   if (/credit|quota|resource_exhausted|insufficient_quota/i.test(msg)) return 'Zmanjkalo je AI kvote/kreditov. Preveri Google AI Studio / Gemini konzolo in poskusi znova.';
   if (/rate.?limit|429/i.test(msg)) return 'Trenutno preveč hkratnih zahtev do AI (rate limit). Poskusi znova čez nekaj minut.';
   if (/GEMINI_API_KEY/i.test(msg)) return 'Manjka ali je neveljaven Gemini API ključ na strežniku.';
@@ -2358,6 +2435,9 @@ module.exports = {
   ensureKeepAlive,
   parseTranslationJson,
   extractTranslationPairsLoosely,
+  translateSubtitle,
+  openSubtitlesErrorDetail,
+  downloadOpenSubtitleFile,
   alignGenderHelper,
   reviewTranslationGender,
   translateChunk,
