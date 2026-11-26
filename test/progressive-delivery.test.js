@@ -54,3 +54,25 @@ test('successfully retrying a previously-failed chunk clears it from failedChunk
   assert.equal(partial.failedChunkIndices.has(0), false);
   assert.ok(partial.doneChunkIndices.has(0));
 });
+
+test('an in-progress subtitle tells the viewer to reselect and marks each untranslated stretch', () => {
+  const { partialProgressSrt } = require('../index');
+  const partial = createPartialTracker(sourceEntries, 2);
+  mergeChunkIntoPartial(partial, [{ id: '2', timecode: '00:00:02,000 --> 00:00:04,000', text: 'Kako si?' }], 0);
+  const srt = partialProgressSrt(partial);
+  assert.match(srt, /^0\n00:00:01,000 --> 00:00:05,000\nPrevod še poteka \(1\/2 delov\)\. Ko bo končan, znova izberite podnapise\./);
+  // Neprevedena 1. in 3. vrstica sta ločena dela, zato ima vsak svojo oznako; prevedena 2. je nima.
+  assert.equal((srt.match(/\[Prevod še poteka - znova izberite podnapise\]/g) || []).length, 2);
+  assert.match(srt, /\nKako si\?\n/);
+});
+
+test('a finished translation is stored without the in-progress flag in the output', () => {
+  const partial = createPartialTracker(sourceEntries, 1);
+  mergeChunkIntoPartial(partial, sourceEntries.map(e => ({ ...e, text: `SL ${e.text}` })), 0);
+  assert.doesNotMatch(partialToSrt(partial), /Prevod še poteka/);
+});
+
+test('the placeholder shown before the first part is ready stays on screen and says to reselect', () => {
+  const { inProgressPlaceholderSrt } = require('../index');
+  assert.match(inProgressPlaceholderSrt(), /^0\n00:00:01,000 --> 09:59:59,000\n\[Prevod še poteka - znova izberite podnapise\]/);
+});
