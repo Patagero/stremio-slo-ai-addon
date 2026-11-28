@@ -32,18 +32,20 @@ function srt(cues) {
 
 // ---------- 1. Hrvaške, italijanske in slovenske oblike ----------
 
+const sa = r => ({ speaker: r.speaker, addressee: r.addressee });
+
 test('Croatian and Italian forms give the speaker and the addressee gender', () => {
-  assert.deepEqual(gender.detectSourceGender('Rekla sam ti.'), { speaker: 'Ženska', addressee: null });
-  assert.deepEqual(gender.detectSourceGender('Gdje si bio?'), { speaker: null, addressee: 'Moški' });
-  assert.deepEqual(gender.detectSourceGender('Jesi li ti luda?'), { speaker: null, addressee: 'Ženska' });
-  assert.deepEqual(gender.detectSourceGender('Nisam ga vidio.'), { speaker: 'Moški', addressee: null });
-  assert.deepEqual(gender.detectSourceGender('Sei pronta?'), { speaker: null, addressee: 'Ženska' });
+  assert.deepEqual(sa(gender.detectSourceGender('Rekla sam ti.')), { speaker: 'Ženska', addressee: null });
+  assert.deepEqual(sa(gender.detectSourceGender('Gdje si bio?')), { speaker: null, addressee: 'Moški' });
+  assert.deepEqual(sa(gender.detectSourceGender('Jesi li ti luda?')), { speaker: null, addressee: 'Ženska' });
+  assert.deepEqual(sa(gender.detectSourceGender('Nisam ga vidio.')), { speaker: 'Moški', addressee: null });
+  assert.deepEqual(sa(gender.detectSourceGender('Sei pronta?')), { speaker: null, addressee: 'Ženska' });
 });
 
 test('look-alike words and the reflexive "si" are not read as gender', () => {
-  assert.deepEqual(gender.detectSourceGender('Ja sam kao on.'), { speaker: null, addressee: null });
-  assert.deepEqual(gender.detectSourceGender('Uzela si je kaput.'), { speaker: null, addressee: null });
-  assert.deepEqual(gender.detectSourceGender('Where were you?'), { speaker: null, addressee: null });
+  assert.deepEqual(sa(gender.detectSourceGender('Ja sam kao on.')), { speaker: null, addressee: null });
+  assert.deepEqual(sa(gender.detectSourceGender('Uzela si je kaput.')), { speaker: null, addressee: null });
+  assert.deepEqual(sa(gender.detectSourceGender('Where were you?')), { speaker: null, addressee: null });
 });
 
 test('Slovenian forms in the translation are detected, "sem" as "here" is not', () => {
@@ -52,8 +54,8 @@ test('Slovenian forms in the translation are detected, "sem" as "here" is not', 
   assert.equal(gender.detectSlovenianGender('Nisem ga videl.').speaker, 'Moški');
   assert.equal(gender.detectSlovenianGender('Kje si bil?').addressee, 'Moški');
   assert.equal(gender.detectSlovenianGender('Ali si ga videla?').addressee, 'Ženska');
-  assert.deepEqual(gender.detectSlovenianGender('Prišel je sem.'), { speaker: null, addressee: null });
-  assert.deepEqual(gender.detectSlovenianGender('Vzela si je čas.'), { speaker: null, addressee: null });
+  assert.deepEqual(sa(gender.detectSlovenianGender('Prišel je sem.')), { speaker: null, addressee: null });
+  assert.deepEqual(sa(gender.detectSlovenianGender('Vzela si je čas.')), { speaker: null, addressee: null });
   assert.equal(gender.detectSlovenianGender('Rekla sem, da je bil tam.').speaker, 'Ženska');
 });
 
@@ -167,30 +169,86 @@ test('two-speaker cues are checked line by line', () => {
   assert.match(issues[0].reasons[0], /vrstica 1/);
 });
 
-test('the review pass sends flagged cues to the stronger model and applies its fixes', async () => {
+function reviewFixture() {
+  const map = buildCharacterGenderMap({ credits: [{ character: 'Ana', gender: 1 }] }, []);
   const sourceEntries = removeSdhEntries(srt([
     { start: 1000, end: 3000, text: 'ANA: I was home.' },
     { start: 4000, end: 6000, text: 'Good.' }
-  ]), buildCharacterGenderMap({ credits: [{ character: 'Ana', gender: 1 }] }, []));
-  const characterMap = buildCharacterGenderMap({ credits: [{ character: 'Ana', gender: 1 }] }, []);
+  ]), map);
   const partial = createPartialTracker(sourceEntries, 1);
   mergeChunkIntoPartial(partial, [
     { id: '1', timecode: sourceEntries[0].timecode, text: 'Bil sem doma.', meta: { s: 'Ana', g: 'M' } },
     { id: '2', timecode: sourceEntries[1].timecode, text: 'Dobro.' }
   ], 0);
+  return { map, sourceEntries, partial };
+}
+
+test('the proofreading pass reads the whole translation, marks flagged cues and applies small fixes', async () => {
+  const { map, sourceEntries, partial } = reviewFixture();
   const calls = [];
-  const result = await reviewTranslationGender(partial, sourceEntries, characterMap, 'Title: Demo', {
+  const result = await reviewTranslationGender(partial, sourceEntries, map, 'Title: Demo', {
     translate: async (systemText, userText, options) => {
       calls.push({ systemText, userText, options });
       return '{"fixes":[{"id":"1","text":"Bila sem doma."}]}';
     }
   });
-  assert.deepEqual(result, { issues: 1, fixed: 1 });
   assert.equal(calls.length, 1);
-  assert.match(calls[0].userText, /\[id=1\]/);
-  assert.doesNotMatch(calls[0].userText, /\[id=2\]/);
+  assert.match(calls[0].systemText, /GENDER and NUMBER/);
+  assert.match(calls[0].userText, /\[id=1\] Ana \| vir: I was home\. \| SL: Bil sem doma\.\n  ! preveri: /);
+  assert.match(calls[0].userText, /\[id=2\] vir: Good\. \| SL: Dobro\./);
+  assert.deepEqual(result, { checked: 2, issues: 1, fixed: 1, rejected: 0, proofread: true });
   assert.equal(partial.entryMap.get('1').text, 'Bila sem doma.');
   assert.equal(partial.entryMap.get('2').text, 'Dobro.');
+});
+
+test('a proofreading fix that rewrites the whole line is rejected', async () => {
+  const { map, sourceEntries, partial } = reviewFixture();
+  const result = await reviewTranslationGender(partial, sourceEntries, map, '', {
+    translate: async () => '{"fixes":[{"id":"2","text":"To je bil res zelo lep in dober dan za vse nas."}]}'
+  });
+  assert.equal(result.rejected, 1);
+  assert.equal(partial.entryMap.get('2').text, 'Dobro.');
+});
+
+test('when a proofreading batch fails its flagged cues still get the narrow review', async () => {
+  const { map, sourceEntries, partial } = reviewFixture();
+  const calls = [];
+  const result = await reviewTranslationGender(partial, sourceEntries, map, '', {
+    translate: async (systemText, userText) => {
+      calls.push(systemText);
+      if (calls.length === 1) throw new Error('boom');
+      return '{"fixes":[{"id":"1","text":"Bila sem doma."}]}';
+    }
+  });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1], /GENDER-AGREEMENT check/);
+  assert.equal(result.fixed, 1);
+  assert.equal(partial.entryMap.get('1').text, 'Bila sem doma.');
+});
+
+test('mentioned people and groups are compared with the Croatian source', () => {
+  const issues = gender.findGenderIssues([
+    { id: '1', sourceText: 'Ona je otišla.', text: 'On je odšel.' },
+    { id: '2', sourceText: 'Bile smo tamo.', text: 'Bili smo tam.' },
+    { id: '3', sourceText: 'Bile smo tamo.', text: 'Sva bili tam.' },
+    { id: '4', sourceText: 'We were there.', helperText: 'Bili smo tamo.', text: 'Sva bili tam.' },
+    { id: '5', sourceText: 'To je bila greška.', text: 'To je bil napačen korak.' }
+  ]);
+  assert.deepEqual(issues.map(i => i.id), ['1', '2', '4']);
+  assert.match(issues[2].reasons[0], /hrvaški podnapis govori o moški ali mešani skupini/);
+});
+
+test('dual and plural forms are told apart in Slovenian', () => {
+  assert.equal(gender.detectSlovenianGender('Sva bila tam.').group, 'Moški');
+  assert.equal(gender.detectSlovenianGender('Sva bili tam.').group, 'Ženska');
+  assert.equal(gender.detectSlovenianGender('Smo šle domov.').group, 'Ženska');
+  assert.equal(gender.detectSlovenianGender('Ali smo tu?').group, null);
+  assert.equal(gender.detectSourceGender('Bile smo tamo.').group, 'Ženska');
+});
+
+test('small gender edits pass the guard, rewrites do not', () => {
+  assert.equal(gender.isMinorEdit('Bil sem doma, ko si prišel.', 'Bila sem doma, ko si prišla.'), true);
+  assert.equal(gender.isMinorEdit('Dobro.', 'To je bil res zelo lep dan.'), false);
 });
 
 test('a failing review keeps the translation as it is', async () => {

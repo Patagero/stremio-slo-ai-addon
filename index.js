@@ -105,7 +105,7 @@ const FAILURE_RETRY_MS = Math.max(0, Number(process.env.FAILURE_RETRY_MS || 2 * 
 
 const addonManifest = {
   id: 'com.stremio.slo.ai.translator',
-  version: '0.8.2',
+  version: '0.9.0',
   name: 'Slo AI Subtitle Translator (Gemini Flash)',
   description: 'Izjemno hitri in varčni slovenski podnapisi z Gemini Flash: ročna izbira vira (HR, IT, ANG), natančno SDH čiščenje in spolno ujemanje.',
   resources: ['subtitles'],
@@ -1125,27 +1125,64 @@ async function fetchGenderHelper(selection, sourceLanguage, sourceSrt, sourceCan
 
 const GENDER_REVIEW_ENABLED = String(process.env.GENDER_REVIEW || 'true').toLowerCase() !== 'false';
 const GENDER_REVIEW_MAX_CUES = Math.max(0, Math.min(2000, Number(process.env.GENDER_REVIEW_MAX_CUES || 400)));
+// Lektorski krog: močnejši model pregleda CELOTEN prevod (ne le spornih vrstic).
+const GENDER_PROOFREAD_ENABLED = String(process.env.GENDER_PROOFREAD || 'true').toLowerCase() !== 'false';
+const GENDER_PROOFREAD_BATCH = Math.max(20, Math.min(300, Number(process.env.GENDER_PROOFREAD_BATCH || 120)));
 
 async function reviewTranslationGender(partial, sourceEntries, characterMap, context, options = {}) {
-  if (!GENDER_REVIEW_ENABLED || GENDER_REVIEW_MAX_CUES <= 0) return { issues: 0, fixed: 0 };
+  const result = { checked: 0, issues: 0, fixed: 0, rejected: 0, proofread: false };
+  if (!GENDER_REVIEW_ENABLED) return result;
   const items = sourceEntries.map(entry => {
     const stored = partial.entryMap.get(entry.id) || {};
-    return { id: entry.id, sourceText: entry.text, text: stored.text || '', hint: entry.genderHint || null, meta: stored.meta || null };
+    return {
+      id: entry.id,
+      sourceText: entry.text,
+      helperText: entry.helperText || null,
+      text: stored.text || '',
+      hint: entry.genderHint || null,
+      meta: stored.meta || null
+    };
   });
   const issues = gender.findGenderIssues(items, { lookup: name => lookupCharacterGender(characterMap, name) });
-  if (!issues.length) return { issues: 0, fixed: 0 };
-  const fixes = await gender.reviewGenderIssues(items, issues, {
-    context,
-    model: ANALYSIS_MODEL,
-    maxCues: GENDER_REVIEW_MAX_CUES,
-    translate: options.translate || translateWithGemini,
-    log: message => console.warn(`[gender] kontrolni krog: ${message}`)
-  });
+  result.issues = issues.length;
+  const translate = options.translate || translateWithGemini;
+  const log = message => console.warn(`[gender] ${message}`);
+  const fixes = new Map();
+
+  let pending = issues;
+  if (GENDER_PROOFREAD_ENABLED) {
+    const proofread = await gender.proofreadGender(items, issues, {
+      context,
+      model: ANALYSIS_MODEL,
+      batchSize: GENDER_PROOFREAD_BATCH,
+      translate,
+      log: message => log(`lektura: ${message}`)
+    });
+    result.proofread = true;
+    result.checked = items.length;
+    result.rejected = proofread.rejected;
+    for (const [id, text] of proofread.fixes) fixes.set(id, text);
+    // Sporne vrstice iz paketov, ki niso uspeli, gredo še v ožji kontrolni krog.
+    pending = proofread.failedIssues;
+  }
+
+  if (pending.length && GENDER_REVIEW_MAX_CUES > 0) {
+    const reviewed = await gender.reviewGenderIssues(items, pending, {
+      context,
+      model: ANALYSIS_MODEL,
+      maxCues: GENDER_REVIEW_MAX_CUES,
+      translate,
+      log: message => log(`kontrolni krog: ${message}`)
+    });
+    for (const [id, text] of reviewed) fixes.set(id, text);
+  }
+
   for (const [id, text] of fixes) {
     const stored = partial.entryMap.get(id);
     if (stored) partial.entryMap.set(id, { ...stored, text });
   }
-  return { issues: issues.length, fixed: fixes.size };
+  result.fixed = fixes.size;
+  return result;
 }
 
 // Seznam virov za ročno izbiro v Stremiu (samo iskanje, brez prenosov).
@@ -1856,7 +1893,9 @@ async function translateSubtitle(imdbId, sourceLanguage, videoHash, strict, seas
     // 5. Kontrolni krog: sporne spolne oblike popravi močnejši model.
     try {
       const review = await reviewTranslationGender(partial, sourceEntries, characterMap, context);
-      if (review.issues) console.log(`[gender] ${imdbId}: kontrolni krog - spornih ${review.issues}, popravljenih ${review.fixed}`);
+      if (review.proofread || review.issues) {
+        console.log(`[gender] ${imdbId}: ${review.proofread ? `lektura ${review.checked} vrstic, ` : ''}spornih ${review.issues}, popravljenih ${review.fixed}${review.rejected ? `, zavrnjenih prevelikih popravkov ${review.rejected}` : ''}`);
+      }
     } catch (error) {
       console.warn(`[gender] ${imdbId}: kontrolni krog ni uspel, prevod ostane nespremenjen: ${error.message}`);
     }

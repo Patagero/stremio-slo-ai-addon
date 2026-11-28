@@ -137,14 +137,38 @@ const IT_RULES = {
 };
 const NO_EXCLUSIONS = new Set();
 
-// Vrne { speaker, addressee } ('Ženska' | 'Moški' | null) za eno vrstico hrvaškega/italijanskega besedila.
+// --- tretja oseba in skupina ---
+// Omenjena oseba: samo ob osebnem zaimku ("ona je otišla", "on je bil"), ker bi samostalniki
+// (napaka, posao) v obeh jezikih lahko imeli različen spol.
+const PRONOUN_F_RE = /(?:^|[^\p{L}])ona(?![\p{L}])/iu;
+const PRONOUN_M_RE = /(?:^|[^\p{L}])on(?![\p{L}])/iu;
+
+function thirdPersonGender(text, rules, excluded) {
+  const hasF = PRONOUN_F_RE.test(text);
+  const hasM = PRONOUN_M_RE.test(text);
+  if (hasF === hasM) return null;
+  const found = matchGender(text, rules, excluded);
+  if (hasF && found === FEMALE) return FEMALE;
+  if (hasM && found === MALE) return MALE;
+  return null;
+}
+
+// Skupina v množini: moški/mešani -li, ženski -le (hrvaško "bili smo" / "bile smo").
+const HR_THIRD_RULES = buildRules('(?:je|nije)', [HR_FEM_PARTICIPLE], [HR_MASC_PARTICIPLE]);
+const HR_GROUP_RULES = buildRules('(?:smo|nismo|ste|niste|su|nisu)', ['[a-zčćšžđ]{2,14}le'], ['[a-zčćšžđ]{2,14}li']);
+const HR_GROUP_NOT = new Set(['ali', 'koli', 'toli', 'boli', 'voli', 'veli', 'žali', 'sile', 'cijele', 'bijele', 'male', 'pale', 'dole', 'gole', 'cijeli', 'bijeli', 'mali', 'vole', 'bole', 'zle']);
+
+// Vrne { speaker, addressee, third, group } ('Ženska' | 'Moški' | null) za eno vrstico hrvaškega/italijanskega besedila.
+// `group` je 'Ženska' samo za izključno žensko skupino, sicer 'Moški' (moška ali mešana).
 function detectSourceGender(text) {
   const t = String(text || '').toLowerCase().replace(/\s+/g, ' ');
-  if (!t.trim()) return { speaker: null, addressee: null };
+  if (!t.trim()) return { speaker: null, addressee: null, third: null, group: null };
   const speaker = matchGender(t, HR_RULES.speaker, HR_NOT_FORM) || matchGender(t, IT_RULES.speaker, NO_EXCLUSIONS);
   const hrAddressee = HR_REFLEXIVE_SI_RE.test(t) ? null : matchGender(t, HR_RULES.addressee, HR_NOT_FORM);
   const addressee = hrAddressee || matchGender(t, IT_RULES.addressee, NO_EXCLUSIONS);
-  return { speaker, addressee };
+  const third = thirdPersonGender(t, HR_THIRD_RULES, HR_NOT_FORM);
+  const group = matchGender(t, HR_GROUP_RULES, HR_GROUP_NOT);
+  return { speaker, addressee, third, group };
 }
 
 // --- slovenščina (prevod) ---
@@ -173,13 +197,24 @@ const SL_RULES = {
 // "si" je tudi povratni zaimek ("Vzela si je čas", "Vzel si bom dopust").
 const SL_REFLEXIVE_SI_RE = /(?:^|[^\p{L}])(?:si\s+(?:je|so|sta|bo|bom|bova|bomo|bodo|sem|sva|smo)|(?:je|so|sta|bo|bodo|bi|sem)\s+si)(?![\p{L}])/iu;
 
-// Vrne { speaker, addressee }: 'Ženska' | 'Moški' | 'mixed' | null za slovensko besedilo.
+const SL_THIRD_RULES = buildRules('(?:je|ni)', [SL_FEM_PARTICIPLE], [SL_MASC_PARTICIPLE]);
+// Množina: moški/mešani -li, ženski -le ("smo šli" / "smo šle").
+const SL_PLURAL_RULES = buildRules('(?:smo|nismo|ste|niste|so|niso)', ['[a-zčšž]{1,14}le'], ['[a-zčšž]{1,14}li']);
+// Dvojina: moški/mešani -la, ženski -li ("sva bila" / "sva bili").
+const SL_DUAL_RULES = buildRules('(?:sva|nisva|sta|nista)', ['[a-zčšž]{1,14}li'], ['[a-zčšž]{1,14}la']);
+const SL_GROUP_NOT = new Set(['ali', 'koli', 'vsaj', 'tele', 'cele', 'bele', 'male', 'dele', 'sele', 'mile', 'cela', 'bela', 'mala', 'dela', 'sila', 'tla', 'zla', 'šola', 'pola', 'mili', 'celi', 'beli', 'mali', 'zli']);
+
+// Vrne { speaker, addressee, third, group }: 'Ženska' | 'Moški' | 'mixed' | null za slovensko besedilo.
 function detectSlovenianGender(text) {
   const t = String(text || '').toLowerCase().replace(/\s+/g, ' ');
-  if (!t.trim()) return { speaker: null, addressee: null };
+  if (!t.trim()) return { speaker: null, addressee: null, third: null, group: null };
   const speaker = matchGender(t, SL_RULES.speaker, SL_NOT_FORM, true);
   const addressee = SL_REFLEXIVE_SI_RE.test(t) ? null : matchGender(t, SL_RULES.addressee, SL_NOT_FORM, true);
-  return { speaker, addressee };
+  const third = thirdPersonGender(t, SL_THIRD_RULES, SL_NOT_FORM);
+  const plural = matchGender(t, SL_PLURAL_RULES, SL_GROUP_NOT, true);
+  const dual = matchGender(t, SL_DUAL_RULES, SL_GROUP_NOT, true);
+  const group = plural && dual && plural !== dual ? 'mixed' : (plural || dual);
+  return { speaker, addressee, third, group };
 }
 
 // ---------- Hrvaški pomočnik: namigi po času ----------
@@ -202,7 +237,7 @@ function buildHelperCues(entries) {
     const lines = rawLines.map(line => ({ ...detectSourceGender(cleanHelperLine(line)), turn: HELPER_SPEAKER_LINE_RE.test(line) }));
     if (!lines.length) continue;
     const twoSpeakers = lines.length === 2 && lines.every(l => l.turn);
-    cues.push({ ...span, twoSpeakers, lines });
+    cues.push({ ...span, twoSpeakers, lines, text: rawLines.map(cleanHelperLine).filter(Boolean).join(' / ') });
   }
   return cues.sort((a, b) => a.start - b.start);
 }
@@ -234,6 +269,8 @@ function applyHelperHints(sourceEntries, helperCues) {
     if (!span) continue;
     const hits = overlapping(helperCues, span);
     if (!hits.length) continue;
+    // Besedilo hrvaškega pomočnika za ta cue: lektor ga vidi ob angleškem viru.
+    entry.helperText = hits.map(cue => cue.text).filter(Boolean).join(' / ');
     const hint = entry.genderHint || (entry.genderHint = { speaker: null, lineSpeakers: null, addressee: null });
     let changed = false;
     if (hint.lineSpeakers) {
@@ -357,6 +394,27 @@ function contradicts(expected, detected) {
   return Boolean(expected && detected && detected !== 'mixed' && detected !== expected.gender);
 }
 
+// Primerjava spolnih oblik vira (hrvaščina/italijanščina ali hrvaški pomočnik) in prevoda
+// za omenjene osebe in skupine (govorec in nagovorjeni gresta prek namigov).
+function compareWithSource(item, detected) {
+  const reasons = [];
+  const sources = [
+    { text: item.sourceText, label: 'izvirnik' },
+    { text: item.helperText, label: 'hrvaški podnapis' }
+  ].filter(source => source.text);
+  for (const source of sources) {
+    const grammar = detectSourceGender(source.text);
+    if (grammar.third && detected.third && detected.third !== 'mixed' && grammar.third !== detected.third) {
+      reasons.push(`${source.label} omenja osebo v ${grammar.third === FEMALE ? 'ženski' : 'moški'} obliki ("${oneLine(source.text).slice(0, 60)}"), prevod pa v ${detected.third === FEMALE ? 'ženski' : 'moški'}`);
+    }
+    if (grammar.group && detected.group && detected.group !== 'mixed' && grammar.group !== detected.group) {
+      reasons.push(`${source.label} govori o ${grammar.group === FEMALE ? 'samo ženski' : 'moški ali mešani'} skupini, prevod pa uporablja ${detected.group === FEMALE ? 'žensko' : 'moško'} obliko množine/dvojine`);
+    }
+    if (reasons.length) break;
+  }
+  return reasons;
+}
+
 // Vrne seznam spornih cue-jev: [{ id, reasons: [...] }].
 // `items`: [{ id, text (slovenski prevod), sourceText, hint, meta: { g, a, s, to } }]
 function findGenderIssues(items, { lookup = null } = {}) {
@@ -390,6 +448,7 @@ function findGenderIssues(items, { lookup = null } = {}) {
         reasons.push(`${expected.addressee.why}, prevajalec pa je nagovorjenega označil kot ${genderLabel(genderFromLetter(meta.a))}`);
       }
       if (detected.speaker === 'mixed' && !expected.speaker) reasons.push('isti govorec ima v prevodu hkrati moške in ženske oblike');
+      reasons.push(...compareWithSource(item, detected));
     }
     if (reasons.length) issues.push({ id: String(item.id), reasons });
   }
@@ -495,6 +554,118 @@ async function reviewGenderIssues(items, issues, { context = '', translate, mode
   return fixes;
 }
 
+// ---------- Lektorski krog za spol (celoten prevod) ----------
+//
+// Močnejši model prebere ves prevod po kosih, ob izvirniku (in hrvaškem pomočniku), in
+// popravi vsako napačno spolno obliko: govorec, nagovorjeni, omenjeni, dvojina, množina.
+// Vrstice, ki jih je kontrolni krog označil kot sporne, dobijo opombo z razlogom.
+// Sprejmemo le majhne popravke, da model ne prepiše prevoda.
+
+function proofreadPrompt(context) {
+  return `You are the senior Slovenian subtitle editor. The translation below is finished; your ONLY job is GENDER and NUMBER agreement.
+
+CONTEXT:
+${context}
+
+CHECK EVERY CUE:
+- Speaker (1st person): "bila sem" / "bil sem", "utrujena sem" / "utrujen sem".
+- Addressee (2nd person): "Kje si bila?" (to a woman) / "Kje si bil?" (to a man). The addressee is usually the person who spoke just before or who is named.
+- Mentioned people (3rd person): "Ana je odšla", "Marko je rekel"; pronouns on/ona, njegov/njen.
+- Dual for exactly two people: "sva šla" (two men or a man and a woman), "sva šli" (two women); "vidva/vidve".
+- Plural: "smo šli" (men or mixed), "smo šle" (only women).
+- Formal "vi" (vikanje) uses the masculine plural participle regardless of gender: "Gospa, kje ste bili?".
+- The source line (vir) and the Croatian line (HR), when given, show gender explicitly ("rekla sam", "bile smo"): trust them.
+- Use the character list and the flow of the scene: speakers alternate, "-" at the start of a line means a new speaker.
+- Lines marked "! preveri" were flagged automatically; check them carefully, but keep the current text if it is actually correct.
+
+RULES:
+- Change ONLY the words needed for correct gender/number. Do not restyle, shorten, or retranslate. Keep line breaks (shown as " / ").
+- Lines marked "(prej)" are context only: never return them.
+- Return ONLY JSON with the cues you changed: {"fixes":[{"id":"12","text":"Popravljeno besedilo"}]}. If nothing needs fixing, return {"fixes":[]}.`;
+}
+
+function proofreadLine(item, issue) {
+  const meta = item.meta || {};
+  const who = meta.s && meta.s !== '?' ? `${meta.s}${meta.to && meta.to !== '?' ? ` → ${meta.to}` : ''} | ` : '';
+  const parts = [`[id=${item.id}] ${who}vir: ${oneLine(item.sourceText)}`];
+  if (item.helperText) parts.push(`HR: ${oneLine(item.helperText)}`);
+  parts.push(`SL: ${oneLine(item.text)}`);
+  let line = parts.join(' | ');
+  if (issue) line += `\n  ! preveri: ${issue.reasons.join('; ')}`;
+  return line;
+}
+
+function buildProofreadUserText(batch, before, issuesById) {
+  const context = before.map(item => `(prej) vir: ${oneLine(item.sourceText)} | SL: ${oneLine(item.text)}`);
+  const lines = batch.map(item => proofreadLine(item, issuesById.get(String(item.id))));
+  return `${context.length ? `${context.join('\n')}\n\n` : ''}CUES:\n${lines.join('\n')}\n\nReturn JSON only.`;
+}
+
+function words(text) {
+  return String(text || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+// Ali je popravek majhen (spolne končnice, zaimki), ne pa nov prevod?
+function isMinorEdit(before, after) {
+  const a = words(before);
+  const b = words(after);
+  if (!a.length || !b.length) return false;
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const longest = Math.max(a.length, b.length);
+  const changed = longest - dp[a.length][b.length];
+  return changed <= Math.max(3, Math.ceil(longest * 0.34));
+}
+
+// Vrne { fixes: Map id -> besedilo, failedIssues: sporni cue-ji iz paketov, ki niso uspeli, rejected }.
+async function proofreadGender(items, issues, { context = '', translate, model, batchSize = 120, overlap = 6, concurrency = 3, log = () => {} } = {}) {
+  const fixes = new Map();
+  const failedIssues = [];
+  let rejected = 0;
+  if (!items.length || typeof translate !== 'function') return { fixes, failedIssues, rejected };
+  const issuesById = new Map(issues.map(issue => [String(issue.id), issue]));
+  const systemText = proofreadPrompt(context);
+  const batches = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    batches.push({ index: batches.length, batch: items.slice(i, i + batchSize), before: items.slice(Math.max(0, i - overlap), i) });
+  }
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const { index, batch, before } = batches[next++];
+      const ids = new Map(batch.map(item => [String(item.id), item]));
+      try {
+        const raw = await translate(systemText, buildProofreadUserText(batch, before, issuesById), {
+          model,
+          maxOutputTokens: Math.max(4096, batch.length * 40)
+        });
+        const parsed = parseReviewJson(raw);
+        for (const [id, text] of parsed) {
+          const item = ids.get(id);
+          if (!item || text === item.text) continue;
+          if (!isMinorEdit(item.text, text)) {
+            rejected += 1;
+            continue;
+          }
+          fixes.set(id, text);
+        }
+      } catch (error) {
+        log(`paket ${index + 1}/${batches.length} ni uspel: ${error.message}`);
+        for (const item of batch) {
+          const issue = issuesById.get(String(item.id));
+          if (issue) failedIssues.push(issue);
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
+  return { fixes, failedIssues, rejected };
+}
+
 module.exports = {
   FEMALE,
   MALE,
@@ -512,6 +683,11 @@ module.exports = {
   buildReviewUserText,
   parseReviewJson,
   reviewGenderIssues,
+  proofreadGender,
+  proofreadPrompt,
+  buildProofreadUserText,
+  isMinorEdit,
+  compareWithSource,
   normalizeSpeakerName,
   splitNames
 };
